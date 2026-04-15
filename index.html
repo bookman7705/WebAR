@@ -86,6 +86,14 @@ let globalR = null;
 let globalT = null;
 let smoothedStepT = [0, 0, 0];
 let lastStepNorm = 0;
+let voStats = {
+  attempts: 0,
+  essentialOk: 0,
+  recoverOk: 0,
+  updates: 0,
+  lastInliers: 0,
+  lastTNorm: 0
+};
 
 const MAX_POINTS = 180;
 const MIN_POINTS = 60;
@@ -246,6 +254,7 @@ function estimateMotion(prevPts, currPts) {
   if (!prevPts || !currPts || prevPts.length < 8 || currPts.length < 8) {
     return false;
   }
+  voStats.attempts += 1;
 
   const prevMat = pointsToMat(prevPts);
   const currMat = pointsToMat(currPts);
@@ -266,48 +275,77 @@ function estimateMotion(prevPts, currPts) {
   const inlierMask = new cv.Mat();
 
   let updated = false;
-  let essential = null;
+  let essential = new cv.Mat();
   try {
-    // OpenCV.js builds differ: some return Mat, others fill an output Mat.
+    // OpenCV.js builds differ by signature; try common forms in order.
     try {
-      const maybeE = cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask);
+      const maybeE = cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0);
       if (maybeE && typeof maybeE.delete === "function" && typeof maybeE.empty === "function") {
-        essential = maybeE;
+        if (!maybeE.empty()) {
+          maybeE.copyTo(essential);
+        }
+        maybeE.delete();
       }
     } catch (_) {
-      // Fallback below.
+      // try fallback signatures below
     }
-    if (!essential) {
-      cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask, E);
-      essential = E;
+
+    if (essential.empty()) {
+      try {
+        const maybeE = cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, 1000, inlierMask);
+        if (maybeE && typeof maybeE.delete === "function" && typeof maybeE.empty === "function") {
+          if (!maybeE.empty()) {
+            maybeE.copyTo(essential);
+          }
+          maybeE.delete();
+        }
+      } catch (_) {
+        // try next signature
+      }
+    }
+
+    if (essential.empty()) {
+      try {
+        cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask, E);
+        if (!E.empty()) {
+          E.copyTo(essential);
+        }
+      } catch (_) {
+        // no-op
+      }
     }
 
     if (essential && !essential.empty()) {
+      voStats.essentialOk += 1;
       const R = new cv.Mat();
       const t = new cv.Mat();
-      cv.recoverPose(essential, currMat, prevMat, K, R, t, inlierMask);
+      const inliers = cv.recoverPose(essential, currMat, prevMat, K, R, t, inlierMask);
+      voStats.lastInliers = Number.isFinite(inliers) ? inliers : 0;
+      voStats.recoverOk += 1;
 
       const txRaw = t.data64F && t.data64F.length > 0 ? t.data64F[0] : 0;
       const tyRaw = t.data64F && t.data64F.length > 1 ? t.data64F[1] : 0;
       const tzRaw = t.data64F && t.data64F.length > 2 ? t.data64F[2] : 0;
       const tNorm = Math.hypot(txRaw, tyRaw, tzRaw);
+      voStats.lastTNorm = tNorm;
 
       if (!R.empty() && !t.empty() && Number.isFinite(tNorm) && tNorm > 1e-9) {
         // T(k) = T(k-1) + R(k-1) * t(k), scale remains unknown in monocular VO.
-        const translated = new cv.Mat();
-        const zero1 = new cv.Mat();
-        cv.gemm(globalR, t, 1, zero1, 0, translated);
+        // Use explicit numeric math to avoid silent matrix-op binding issues.
+        const gR = globalR.data64F;
+        const sx = (gR[0] * txRaw) + (gR[1] * tyRaw) + (gR[2] * tzRaw);
+        const sy = (gR[3] * txRaw) + (gR[4] * tyRaw) + (gR[5] * tzRaw);
+        const sz = (gR[6] * txRaw) + (gR[7] * tyRaw) + (gR[8] * tzRaw);
 
         // Low-pass each translation step to reduce frame-to-frame jitter.
-        const sx = translated.data64F[0];
-        const sy = translated.data64F[1];
-        const sz = translated.data64F[2];
         smoothedStepT[0] = (VO_STEP_SMOOTH_ALPHA * sx) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[0]);
         smoothedStepT[1] = (VO_STEP_SMOOTH_ALPHA * sy) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[1]);
         smoothedStepT[2] = (VO_STEP_SMOOTH_ALPHA * sz) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[2]);
         lastStepNorm = Math.hypot(smoothedStepT[0], smoothedStepT[1], smoothedStepT[2]);
-        const stepMat = cv.matFromArray(3, 1, cv.CV_64F, smoothedStepT);
-        cv.add(globalT, stepMat, globalT);
+        const gT = globalT.data64F;
+        gT[0] += smoothedStepT[0];
+        gT[1] += smoothedStepT[1];
+        gT[2] += smoothedStepT[2];
 
         const composedR = new cv.Mat();
         const zero2 = new cv.Mat();
@@ -315,11 +353,9 @@ function estimateMotion(prevPts, currPts) {
         globalR.delete();
         globalR = composedR;
 
-        zero1.delete();
         zero2.delete();
-        stepMat.delete();
-        translated.delete();
         updated = true;
+        voStats.updates += 1;
       }
 
       R.delete();
@@ -333,9 +369,7 @@ function estimateMotion(prevPts, currPts) {
   currMat.delete();
   K.delete();
   E.delete();
-  if (essential && essential !== E) {
-    essential.delete();
-  }
+  essential.delete();
   inlierMask.delete();
   return updated;
 }
@@ -532,7 +566,7 @@ function processFrame() {
     const ty = globalT.data64F[1];
     const tz = globalT.data64F[2];
     statusText.textContent =
-      `Pts: ${trackedPoints.length} | step:${lastStepNorm.toFixed(5)} | T: ${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
+      `Pts:${trackedPoints.length} step:${lastStepNorm.toFixed(5)} tN:${voStats.lastTNorm.toFixed(5)} inl:${voStats.lastInliers} upd:${voStats.updates}/${voStats.attempts} | T:${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
   } else {
     statusText.textContent = `Pts: ${trackedPoints.length} | VO initializing...`;
   }
@@ -561,6 +595,14 @@ async function init() {
   globalT = cv.matFromArray(3, 1, cv.CV_64F, [0, 0, 0]);
   smoothedStepT = [0, 0, 0];
   lastStepNorm = 0;
+  voStats = {
+    attempts: 0,
+    essentialOk: 0,
+    recoverOk: 0,
+    updates: 0,
+    lastInliers: 0,
+    lastTNorm: 0
+  };
 
   streaming = true;
   statusText.textContent = "Tracking points / VO initializing...";
