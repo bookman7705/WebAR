@@ -34,7 +34,19 @@ let ctx = canvas.getContext("2d");
 let streaming = false;
 
 let src, gray;
-let orb;
+let prevGray = null;
+let trackedPoints = [];
+let smoothedDrawPoints = [];
+
+const MAX_POINTS = 180;
+const MIN_POINTS = 60;
+let lkWinSize = null;
+let lkCriteria = null;
+const DRAW_SMOOTH_ALPHA = 0.22;
+const PIXEL_DEADZONE = 0.8;
+const LK_ERR_MAX = 18;
+const FLOW_OUTLIER_BASE = 2.8;
+const FLOW_OUTLIER_SCALE = 2.4;
 
 /* ---------------- CAMERA ---------------- */
 async function startCamera() {
@@ -67,6 +79,66 @@ function waitForCV() {
   });
 }
 
+function detectFeatures(grayMat, maxCorners = MAX_POINTS) {
+  const corners = new cv.Mat();
+  const mask = new cv.Mat();
+
+  cv.goodFeaturesToTrack(
+    grayMat,
+    corners,
+    maxCorners,
+    0.01,
+    8,
+    mask
+  );
+
+  const points = [];
+  const data = corners.data32F || [];
+  for (let i = 0; i + 1 < data.length; i += 2) {
+    points.push({ x: data[i], y: data[i + 1] });
+  }
+
+  corners.delete();
+  mask.delete();
+  return points;
+}
+
+function pointsToMat(points) {
+  const flat = [];
+  for (let i = 0; i < points.length; i++) {
+    flat.push(points[i].x, points[i].y);
+  }
+  return cv.matFromArray(points.length, 1, cv.CV_32FC2, flat);
+}
+
+function smoothPoint(current, previous) {
+  if (!previous) {
+    return { x: current.x, y: current.y };
+  }
+
+  const dx = current.x - previous.x;
+  const dy = current.y - previous.y;
+  const dist = Math.hypot(dx, dy);
+
+  if (dist < PIXEL_DEADZONE) {
+    return { x: previous.x, y: previous.y };
+  }
+
+  return {
+    x: (DRAW_SMOOTH_ALPHA * current.x) + ((1 - DRAW_SMOOTH_ALPHA) * previous.x),
+    y: (DRAW_SMOOTH_ALPHA * current.y) + ((1 - DRAW_SMOOTH_ALPHA) * previous.y)
+  };
+}
+
+function median(values) {
+  if (!values.length) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) * 0.5
+    : sorted[mid];
+}
+
 /* ---------------- FRAME LOOP ---------------- */
 function processFrame() {
   if (!streaming) return;
@@ -79,25 +151,113 @@ function processFrame() {
 
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-  // IMPORTANT FIX:
-  // detectAndCompute internally manages keypoints
-  let keypoints = new cv.KeyPointVector();
-  let descriptors = new cv.Mat();
+  if (!prevGray || trackedPoints.length < MIN_POINTS) {
+    trackedPoints = detectFeatures(gray, MAX_POINTS);
+    smoothedDrawPoints = trackedPoints.map((p) => ({ x: p.x, y: p.y }));
+  } else {
+    const prevPtsMat = pointsToMat(trackedPoints);
+    const nextPtsMat = new cv.Mat();
+    const status = new cv.Mat();
+    const err = new cv.Mat();
 
-  orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
+    cv.calcOpticalFlowPyrLK(
+      prevGray,
+      gray,
+      prevPtsMat,
+      nextPtsMat,
+      status,
+      err,
+      lkWinSize,
+      3,
+      lkCriteria
+    );
 
-  // draw keypoints
-  for (let i = 0; i < keypoints.size(); i++) {
-    let kp = keypoints.get(i);
+    const candidates = [];
+    const statusLen = Math.min(status.rows * status.cols, trackedPoints.length);
+    const nextData = nextPtsMat.data32F || [];
 
+    for (let i = 0; i < statusLen; i++) {
+      if (status.data[i] !== 1) {
+        continue;
+      }
+      const nx = nextData[i * 2];
+      const ny = nextData[(i * 2) + 1];
+      const lkErr = err.data32F ? err.data32F[i] : 0;
+
+      if (
+        !Number.isFinite(nx) ||
+        !Number.isFinite(ny) ||
+        nx < 0 ||
+        ny < 0 ||
+        nx >= canvas.width ||
+        ny >= canvas.height ||
+        (Number.isFinite(lkErr) && lkErr > LK_ERR_MAX)
+      ) {
+        continue;
+      }
+
+      candidates.push({
+        raw: { x: nx, y: ny },
+        prev: trackedPoints[i],
+        prevDraw: smoothedDrawPoints[i]
+      });
+    }
+
+    const nextPts = [];
+    const nextDraw = [];
+    if (candidates.length > 0) {
+      const flowDists = [];
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        flowDists.push(Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y));
+      }
+      const medFlow = median(flowDists);
+      const madLike = median(flowDists.map((d) => Math.abs(d - medFlow)));
+      const flowThreshold = Math.max(
+        FLOW_OUTLIER_BASE,
+        medFlow + (FLOW_OUTLIER_SCALE * (madLike + 0.15))
+      );
+
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        const flow = Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y);
+        if (flow > flowThreshold) {
+          continue;
+        }
+        nextPts.push(c.raw);
+        nextDraw.push(smoothPoint(c.raw, c.prevDraw));
+      }
+    }
+
+    trackedPoints = nextPts;
+    smoothedDrawPoints = nextDraw;
+
+    prevPtsMat.delete();
+    nextPtsMat.delete();
+    status.delete();
+    err.delete();
+
+    if (trackedPoints.length < MIN_POINTS) {
+      const refill = detectFeatures(gray, MAX_POINTS - trackedPoints.length);
+      for (let i = 0; i < refill.length && trackedPoints.length < MAX_POINTS; i++) {
+        trackedPoints.push(refill[i]);
+        smoothedDrawPoints.push({ x: refill[i].x, y: refill[i].y });
+      }
+    }
+  }
+
+  for (let i = 0; i < smoothedDrawPoints.length; i++) {
+    const p = smoothedDrawPoints[i];
     ctx.beginPath();
-    ctx.arc(kp.pt.x, kp.pt.y, 2, 0, 2 * Math.PI);
+    ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
     ctx.fillStyle = "lime";
     ctx.fill();
   }
 
-  keypoints.delete();
-  descriptors.delete();
+  if (prevGray) {
+    prevGray.delete();
+  }
+  prevGray = gray.clone();
 
   requestAnimationFrame(processFrame);
 }
@@ -112,8 +272,12 @@ async function init() {
 
   src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
   gray = new cv.Mat();
-
-  orb = new cv.ORB();
+  lkWinSize = new cv.Size(21, 21);
+  lkCriteria = new cv.TermCriteria(
+    cv.TermCriteria_EPS + cv.TermCriteria_COUNT,
+    30,
+    0.01
+  );
 
   streaming = true;
   requestAnimationFrame(processFrame);
