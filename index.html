@@ -122,124 +122,143 @@ function log(m){
 }
 
 function process(){
-
   frameId++;
 
-  ctx.drawImage(video,0,0,canvas.width,canvas.height);
-  src.data.set(ctx.getImageData(0,0,canvas.width,canvas.height).data);
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  let kp = null;
+  let des = null;
+  let matches = null;
+  let mat1 = null;
+  let mat2 = null;
+  let mask = null;
+  let E = null;
+  let R = null;
+  let t = null;
 
-  let kp = new cv.KeyPointVector();
-  let des = new cv.Mat();
+  try {
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    src.data.set(ctx.getImageData(0,0,canvas.width,canvas.height).data);
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-  orb.detectAndCompute(gray,new cv.Mat(),kp,des);
+    kp = new cv.KeyPointVector();
+    des = new cv.Mat();
+    orb.detectAndCompute(gray,new cv.Mat(),kp,des);
 
-  let currPts=[];
-  for(let i=0;i<kp.size();i++){
-    let k=kp.get(i);
-    currPts.push({x:k.pt.x,y:k.pt.y});
-  }
-
-  if(!prevDes || prevDes.rows===0){
-    prevKp = currPts;
-    prevDes = des.clone();
-    requestAnimationFrame(process);
-    return;
-  }
-
-  let matches = new cv.DMatchVector();
-  bf.match(prevDes, des, matches);
-
-  let good=[];
-  for(let i=0;i<matches.size();i++){
-    let m=matches.get(i);
-    good.push(m);
-  }
-
-  good.sort((a,b)=>a.distance-b.distance);
-  good = good.slice(0,120);
-
-  let p1=[], p2=[];
-
-  for(let m of good){
-    if(m.queryIdx<prevKp.length && m.trainIdx<currPts.length){
-      p1.push(prevKp[m.queryIdx]);
-      p2.push(currPts[m.trainIdx]);
+    let currPts=[];
+    for(let i=0;i<kp.size();i++){
+      let k=kp.get(i);
+      currPts.push({x:k.pt.x,y:k.pt.y});
     }
-  }
 
-  if(p1.length < 10){
-    prevKp = currPts;
-    prevDes = des.clone();
-    requestAnimationFrame(process);
-    return;
-  }
+    if(!prevDes || prevDes.rows===0){
+      prevKp = currPts;
+      prevDes = des.clone();
+      return;
+    }
 
-  let mat1 = toMat(p1);
-  let mat2 = toMat(p2);
+    matches = new cv.DMatchVector();
+    bf.match(prevDes, des, matches);
 
-  let mask = new cv.Mat();
+    let good=[];
+    for(let i=0;i<matches.size();i++){
+      let m=matches.get(i);
+      good.push(m);
+    }
 
-  let E = cv.findEssentialMat(
-    mat2, mat1,
-    FOCAL,
-    new cv.Point(canvas.width/2, canvas.height/2),
-    cv.RANSAC,
-    0.999,
-    1.0,
-    mask
-  );
+    good.sort((a,b)=>a.distance-b.distance);
+    good = good.slice(0,120);
 
-  if(E.empty()){
-    log("E failed");
-    return;
-  }
+    let p1=[], p2=[];
 
-  let R = new cv.Mat();
-  let t = new cv.Mat();
+    for(let m of good){
+      if(m.queryIdx<prevKp.length && m.trainIdx<currPts.length){
+        p1.push(prevKp[m.queryIdx]);
+        p2.push(currPts[m.trainIdx]);
+      }
+    }
 
-  let inliers = cv.recoverPose(E, mat2, mat1, R, t, FOCAL, new cv.Point(canvas.width/2, canvas.height/2), mask);
+    if(p1.length < 10){
+      prevKp = currPts;
+      prevDes = des.clone();
+      return;
+    }
 
-  if(inliers < MIN_INLIERS){
-    log("low inliers: " + inliers);
-    return;
-  }
+    mat1 = toMat(p1);
+    mat2 = toMat(p2);
+    mask = new cv.Mat();
 
-  // ===== FIX 1: SCALE BOOST (debug visibility)
-  let tt = [t.data64F[0], t.data64F[1], t.data64F[2]];
-  const SCALE = 2.5;
-  tt = tt.map(v=>v*SCALE);
+    E = cv.findEssentialMat(
+      mat2, mat1,
+      FOCAL,
+      new cv.Point(canvas.width/2, canvas.height/2),
+      cv.RANSAC,
+      0.999,
+      1.0,
+      mask
+    );
 
-  // ===== FIX 2: CORRECT SE(3) UPDATE
-  let newR = matMul3(globalR, [
-    R.data64F[0],R.data64F[1],R.data64F[2],
-    R.data64F[3],R.data64F[4],R.data64F[5],
-    R.data64F[6],R.data64F[7],R.data64F[8],
-  ]);
+    if(E.empty()){
+      log("E failed");
+      prevKp = currPts;
+      prevDes = des.clone();
+      return;
+    }
 
-  globalR = newR;
+    R = new cv.Mat();
+    t = new cv.Mat();
 
-  let worldT = matVec3(globalR, tt);
+    let inliers = cv.recoverPose(E, mat2, mat1, R, t, FOCAL, new cv.Point(canvas.width/2, canvas.height/2), mask);
 
-  globalT[0]+=worldT[0];
-  globalT[1]+=worldT[1];
-  globalT[2]+=worldT[2];
+    if(inliers < MIN_INLIERS){
+      log("low inliers: " + inliers);
+      prevKp = currPts;
+      prevDes = des.clone();
+      return;
+    }
 
-  log(
+    // ===== FIX 1: SCALE BOOST (debug visibility)
+    let tt = [t.data64F[0], t.data64F[1], t.data64F[2]];
+    const SCALE = 2.5;
+    tt = tt.map(v=>v*SCALE);
+
+    // ===== FIX 2: CORRECT SE(3) UPDATE
+    let newR = matMul3(globalR, [
+      R.data64F[0],R.data64F[1],R.data64F[2],
+      R.data64F[3],R.data64F[4],R.data64F[5],
+      R.data64F[6],R.data64F[7],R.data64F[8],
+    ]);
+
+    globalR = newR;
+
+    let worldT = matVec3(globalR, tt);
+
+    globalT[0]+=worldT[0];
+    globalT[1]+=worldT[1];
+    globalT[2]+=worldT[2];
+
+    log(
 `inliers: ${inliers}
 t: ${tt.map(v=>v.toFixed(2))}
 globalT: ${globalT.map(v=>v.toFixed(2))}
 frame: ${frameId}`
-  );
+    );
 
-  prevKp = currPts;
-  prevDes = des.clone();
+    prevKp = currPts;
+    prevDes = des.clone();
+  } catch (err) {
+    log("process error: " + (err && err.message ? err.message : err));
+  } finally {
+    if (matches) matches.delete();
+    if (mat1) mat1.delete();
+    if (mat2) mat2.delete();
+    if (mask) mask.delete();
+    if (E) E.delete();
+    if (R) R.delete();
+    if (t) t.delete();
+    if (kp) kp.delete();
+    if (des) des.delete();
 
-  mat1.delete(); mat2.delete(); mask.delete();
-  E.delete(); R.delete(); t.delete();
-  kp.delete(); des.delete();
-
-  requestAnimationFrame(process);
+    requestAnimationFrame(process);
+  }
 }
 
 async function init(){
