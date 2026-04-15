@@ -214,7 +214,6 @@
 
       modules = {
         AlvaAR: alvaModule.AlvaAR,
-        Camera: utilsModule.Camera,
         onFrame: utilsModule.onFrame,
         resize2cover: utilsModule.resize2cover,
       };
@@ -264,6 +263,55 @@
       poseMatrixValueEl.textContent = "Pose matrix unavailable";
     }
 
+    async function openCameraStream() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("Camera API is not available in this browser.");
+      }
+
+      const candidates = [
+        { video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+        { video: { facingMode: "environment" }, audio: false },
+        { video: true, audio: false },
+      ];
+
+      const failures = [];
+
+      for (const constraints of candidates) {
+        try {
+          return await navigator.mediaDevices.getUserMedia(constraints);
+        } catch (error) {
+          const name = error && error.name ? error.name : "UnknownError";
+          const message = error && error.message ? error.message : String(error);
+          failures.push(`${name}: ${message}`);
+        }
+      }
+
+      throw new Error(failures.join(" | "));
+    }
+
+    async function attachStreamToVideo(stream) {
+      videoEl.srcObject = stream;
+
+      await new Promise((resolve, reject) => {
+        const onLoaded = async () => {
+          try {
+            await videoEl.play();
+            resolve();
+          } catch (error) {
+            reject(error);
+          } finally {
+            videoEl.onloadedmetadata = null;
+            videoEl.onerror = null;
+          }
+        };
+
+        videoEl.onloadedmetadata = onLoaded;
+        videoEl.onerror = () => {
+          reject(new Error("Video element failed to load camera stream."));
+        };
+      });
+    }
+
     async function startSLAM() {
       if (hasStarted) {
         return;
@@ -274,25 +322,16 @@
       startButtonEl.textContent = "Starting...";
       statusValueEl.textContent = "Loading scripts...";
 
-      const constraints = {
-        video: {
-          facingMode: "environment",
-          aspectRatio: 16 / 9,
-          width: { ideal: 1280 },
-        },
-        audio: false,
-      };
-
       try {
-        const { AlvaAR, Camera, onFrame, resize2cover } = await ensureModulesLoaded();
-        const media = await Camera.Initialize(constraints.video);
-        const video = media.el;
-        videoEl.srcObject = video.srcObject;
-        await videoEl.play();
+        const { AlvaAR, onFrame, resize2cover } = await ensureModulesLoaded();
+        statusValueEl.textContent = "Requesting camera access...";
+
+        const stream = await openCameraStream();
+        await attachStreamToVideo(stream);
 
         const cover = resize2cover(
-          video.videoWidth,
-          video.videoHeight,
+          videoEl.videoWidth,
+          videoEl.videoHeight,
           app.clientWidth,
           app.clientHeight
         );
@@ -321,8 +360,8 @@
             videoEl,
             0,
             0,
-            video.videoWidth,
-            video.videoHeight,
+            videoEl.videoWidth,
+            videoEl.videoHeight,
             cover.x,
             cover.y,
             cover.width,
@@ -348,7 +387,7 @@
         startButtonEl.disabled = false;
         startButtonEl.textContent = "Start Camera Pose";
         alert(
-          `Could not start AR SLAM camera.\n\n${message}\n\nTip: serve this page from http://localhost or https:// (not file://).`
+          `Could not start AR SLAM camera.\n\n${message}\n\nIf this is mobile Safari/Chrome:\n- ensure camera permission is allowed for this site\n- close other apps using camera\n- reload page and tap Start again\n- use https:// and not in-app browser`
         );
       }
     }
