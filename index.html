@@ -77,8 +77,10 @@
   <button id="startButton" type="button">Start AR Camera</button>
 </div>
 <div id="statusText">Tap "Start AR Camera" to begin.</div>
-<div id="voDebug">Tracked Points: 0
+<div id="voDebug">Keypoints: 0
+Matches: 0
 Inliers: 0
+AvgDist: 0.00
 t: [0.00, 0.00, 0.00]
 R:
 1.00 0.00 0.00
@@ -99,23 +101,13 @@ let statusText = document.getElementById("statusText");
 let voDebug = document.getElementById("voDebug");
 
 let streaming = false;
+let src = null;
+let gray = null;
+let orb = null;
+let bf = null;
 
-let src, gray;
-let prevGray = null;
-let trackedPoints = [];
-let smoothedDrawPoints = [];
-
-const MAX_POINTS = 180;
-const MIN_POINTS = 60;
-let lkWinSize = null;
-let lkCriteria = null;
-const DRAW_SMOOTH_ALPHA = 0.5;
-const PIXEL_DEADZONE = 0.0;
-const LK_ERR_MAX = 18;
-const FB_ERR_MAX = 1.8;
-const FLOW_OUTLIER_BASE = 2.8;
-const FLOW_OUTLIER_SCALE = 2.4;
-const REFILL_BLOCK_RADIUS = 10;
+const MAX_ORB_FEATURES = 450;
+const MAX_MATCHES = 150;
 const MIN_POSE_POINTS = 8;
 const MIN_POSE_INLIERS = 25;
 const ESSENTIAL_RANSAC_THRESH = 1.0;
@@ -123,23 +115,29 @@ const ARROW_SCALE = 180;
 const STALL_DELTA_EPS = 0.015;
 const STALL_FRAME_LIMIT = 10;
 
+let prevKeypoints = null;
+let prevDescriptors = null;
+
 let globalR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 let globalT = [0, 0, 0];
 let latestRelativeT = [0, 0, 0];
 let latestRelativeR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-let essentialInlierCount = 0;
-let inlierDrawPoints = [];
-let inlierDrawMask = [];
 let trajectory = [[0, 0, 0]];
+
+let keypointCount = 0;
+let matchCount = 0;
+let essentialInlierCount = 0;
+let avgMatchDistance = 0;
+let motionActivity = "INIT";
 let lastRelativeT = [0, 0, 0];
 let staticMotionFrames = 0;
-let motionActivity = "INIT";
+let lastDeltaMotion = 0;
 let lastENorm = 0;
 let lastRDet = 1;
-let lastDeltaMotion = 0;
+
+let matchDrawPairs = [];
 let reseedRequested = false;
 
-/* ---------------- CAMERA ---------------- */
 async function startCamera() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     throw new Error("Camera API is not available in this browser.");
@@ -179,7 +177,6 @@ async function startCamera() {
   });
 }
 
-/* ---------------- WAIT FOR OPENCV ---------------- */
 function waitForCV() {
   return new Promise(resolve => {
     const check = () => {
@@ -193,49 +190,61 @@ function waitForCV() {
   });
 }
 
-function detectFeatures(grayMat, maxCorners = MAX_POINTS, blockedPoints = [], blockRadius = REFILL_BLOCK_RADIUS) {
-  const corners = new cv.Mat();
-  const mask = new cv.Mat(grayMat.rows, grayMat.cols, cv.CV_8UC1, new cv.Scalar(255));
+function updateCanvasSize() {
+  const w = video.videoWidth || window.innerWidth;
+  const h = video.videoHeight || window.innerHeight;
+  canvas.width = w;
+  canvas.height = h;
+}
 
-  for (let i = 0; i < blockedPoints.length; i++) {
-    const p = blockedPoints[i];
-    if (
-      !Number.isFinite(p.x) ||
-      !Number.isFinite(p.y) ||
-      p.x < 0 ||
-      p.y < 0 ||
-      p.x >= grayMat.cols ||
-      p.y >= grayMat.rows
-    ) {
-      continue;
+function resetFrameState() {
+  keypointCount = 0;
+  matchCount = 0;
+  essentialInlierCount = 0;
+  avgMatchDistance = 0;
+  lastENorm = 0;
+  lastRDet = 1;
+  lastDeltaMotion = 0;
+  latestRelativeT = [0, 0, 0];
+  latestRelativeR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  motionActivity = "RESET";
+  matchDrawPairs = [];
+}
+
+function resetMatcherState(reason = "reset") {
+  if (prevDescriptors) {
+    prevDescriptors.delete();
+    prevDescriptors = null;
+  }
+  prevKeypoints = null;
+  reseedRequested = false;
+  staticMotionFrames = 0;
+  lastRelativeT = [0, 0, 0];
+  resetFrameState();
+  statusText.textContent = `ORB matching (${reason})...`;
+}
+
+function ensureFrameBufferSize() {
+  if (!src || src.rows !== canvas.height || src.cols !== canvas.width) {
+    if (src) src.delete();
+    src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
+    resetMatcherState("resize");
+  }
+}
+
+function requestFeatureReseed(reason) {
+  if (!reseedRequested) {
+    if (reason === "pose_stall") {
+      console.warn("POSE STALL DETECTED");
+    } else {
+      console.warn(`FEATURE RESEED (${reason})`);
     }
-    cv.circle(
-      mask,
-      new cv.Point(Math.round(p.x), Math.round(p.y)),
-      blockRadius,
-      new cv.Scalar(0),
-      -1
-    );
   }
+  reseedRequested = true;
+}
 
-  cv.goodFeaturesToTrack(
-    grayMat,
-    corners,
-    maxCorners,
-    0.01,
-    8,
-    mask
-  );
-
-  const points = [];
-  const data = corners.data32F || [];
-  for (let i = 0; i + 1 < data.length; i += 2) {
-    points.push({ x: data[i], y: data[i + 1] });
-  }
-
-  corners.delete();
-  mask.delete();
-  return points;
+function matData(mat) {
+  return mat.data64F || mat.data32F || mat.data || mat.data8U || [];
 }
 
 function pointsToMat(points) {
@@ -244,63 +253,6 @@ function pointsToMat(points) {
     flat.push(points[i].x, points[i].y);
   }
   return cv.matFromArray(points.length, 1, cv.CV_32FC2, flat);
-}
-
-function smoothPoint(current, previous) {
-  if (!previous) {
-    return { x: current.x, y: current.y };
-  }
-
-  const dx = current.x - previous.x;
-  const dy = current.y - previous.y;
-  const dist = Math.hypot(dx, dy);
-
-  if (dist < PIXEL_DEADZONE) {
-    return { x: previous.x, y: previous.y };
-  }
-
-  return {
-    x: (DRAW_SMOOTH_ALPHA * current.x) + ((1 - DRAW_SMOOTH_ALPHA) * previous.x),
-    y: (DRAW_SMOOTH_ALPHA * current.y) + ((1 - DRAW_SMOOTH_ALPHA) * previous.y)
-  };
-}
-
-function median(values) {
-  if (!values.length) return 0;
-  const sorted = values.slice().sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0
-    ? (sorted[mid - 1] + sorted[mid]) * 0.5
-    : sorted[mid];
-}
-
-function updateCanvasSize() {
-  const w = video.videoWidth || window.innerWidth;
-  const h = video.videoHeight || window.innerHeight;
-  canvas.width = w;
-  canvas.height = h;
-}
-
-function resetTrackingState() {
-  trackedPoints = [];
-  smoothedDrawPoints = [];
-  essentialInlierCount = 0;
-  inlierDrawPoints = [];
-  inlierDrawMask = [];
-  latestRelativeT = [0, 0, 0];
-  latestRelativeR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-}
-
-function ensureFrameBufferSize() {
-  if (!src || src.rows !== canvas.height || src.cols !== canvas.width) {
-    if (src) src.delete();
-    src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
-    if (prevGray) {
-      prevGray.delete();
-      prevGray = null;
-    }
-    resetTrackingState();
-  }
 }
 
 function multiplyMat3(a, b) {
@@ -327,21 +279,15 @@ function multiplyMatVec3(m, v) {
 
 function readMat3x3(mat) {
   const srcData = mat.data64F || mat.data32F;
-  if (!srcData || srcData.length < 9) {
-    return null;
-  }
+  if (!srcData || srcData.length < 9) return null;
   const out = new Array(9);
-  for (let i = 0; i < 9; i++) {
-    out[i] = srcData[i];
-  }
+  for (let i = 0; i < 9; i++) out[i] = srcData[i];
   return out;
 }
 
 function readMat3x1(mat) {
   const srcData = mat.data64F || mat.data32F;
-  if (!srcData || srcData.length < 3) {
-    return null;
-  }
+  if (!srcData || srcData.length < 3) return null;
   return [srcData[0], srcData[1], srcData[2]];
 }
 
@@ -353,16 +299,11 @@ function isFiniteVec(arr) {
   return true;
 }
 
-function matData(mat) {
-  return mat.data64F || mat.data32F || mat.data || mat.data8U || [];
-}
-
 function frobeniusNorm(data) {
   let sumSq = 0;
   for (let i = 0; i < data.length; i++) {
-    const v = data[i];
-    if (!Number.isFinite(v)) return NaN;
-    sumSq += v * v;
+    if (!Number.isFinite(data[i])) return NaN;
+    sumSq += data[i] * data[i];
   }
   return Math.sqrt(sumSq);
 }
@@ -371,30 +312,6 @@ function det3(m) {
   return (m[0] * ((m[4] * m[8]) - (m[5] * m[7])))
     - (m[1] * ((m[3] * m[8]) - (m[5] * m[6])))
     + (m[2] * ((m[3] * m[7]) - (m[4] * m[6])));
-}
-
-function requestFeatureReseed(reason) {
-  if (!reseedRequested) {
-    if (reason === "pose_stall") {
-      console.warn("POSE STALL DETECTED");
-    } else {
-      console.warn(`FEATURE RESEED (${reason})`);
-    }
-  }
-  reseedRequested = true;
-}
-
-function reseedFeatures(grayMat, reason = "reset") {
-  resetTrackingState();
-  trackedPoints = detectFeatures(grayMat, MAX_POINTS);
-  smoothedDrawPoints = trackedPoints.map((p) => ({ x: p.x, y: p.y }));
-  if (prevGray) {
-    prevGray.delete();
-    prevGray = null;
-  }
-  prevGray = grayMat.clone();
-  reseedRequested = false;
-  statusText.textContent = `Tracking points (${reason})...`;
 }
 
 function drawArrow(x0, y0, x1, y1, color) {
@@ -419,11 +336,13 @@ function updateDebugOverlay() {
   const tx = latestRelativeT[0];
   const ty = latestRelativeT[1];
   const tz = latestRelativeT[2];
-  const motion = Math.hypot(tx, ty, tz);
+  const motionMag = Math.hypot(tx, ty, tz);
 
   voDebug.textContent =
-`Tracked Points: ${trackedPoints.length}
+`Keypoints: ${keypointCount}
+Matches: ${matchCount}
 Inliers: ${essentialInlierCount}
+AvgDist: ${avgMatchDistance.toFixed(2)}
 E-norm: ${Number.isFinite(lastENorm) ? lastENorm.toFixed(4) : "nan"}
 det(R): ${Number.isFinite(lastRDet) ? lastRDet.toFixed(4) : "nan"}
 t: [${tx.toFixed(2)}, ${ty.toFixed(2)}, ${tz.toFixed(2)}]
@@ -434,25 +353,23 @@ R:
 ${latestRelativeR[0].toFixed(2)} ${latestRelativeR[1].toFixed(2)} ${latestRelativeR[2].toFixed(2)}
 ${latestRelativeR[3].toFixed(2)} ${latestRelativeR[4].toFixed(2)} ${latestRelativeR[5].toFixed(2)}
 ${latestRelativeR[6].toFixed(2)} ${latestRelativeR[7].toFixed(2)} ${latestRelativeR[8].toFixed(2)}
-|t|: ${motion.toFixed(2)}`;
+|t|: ${motionMag.toFixed(2)}`;
 }
 
-function estimatePoseFromTracks(prevPoints, currPoints) {
+function estimatePoseFromMatches(prevPts, currPts) {
   essentialInlierCount = 0;
-  inlierDrawPoints = [];
-  inlierDrawMask = [];
   lastENorm = 0;
   lastRDet = 1;
 
-  if (prevPoints.length < MIN_POSE_POINTS || currPoints.length !== prevPoints.length) {
+  if (prevPts.length < MIN_POSE_POINTS || currPts.length !== prevPts.length) {
+    motionActivity = "INSUFFICIENT_MATCHES";
     latestRelativeT = [0, 0, 0];
-    motionActivity = "INSUFFICIENT_POINTS";
-    return;
+    latestRelativeR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    return new Array(currPts.length).fill(false);
   }
 
-  // Enforce ordering: currPts -> prevPts in both calls.
-  const prevPtsMat = pointsToMat(prevPoints);
-  const currPtsMat = pointsToMat(currPoints);
+  const prevPtsMat = pointsToMat(prevPts);
+  const currPtsMat = pointsToMat(currPts);
   const inlierMask = new cv.Mat();
   const poseMask = new cv.Mat();
   let inlierPrevMat = null;
@@ -460,6 +377,7 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
   let essential = null;
   let R = null;
   let t = null;
+  const drawInliers = new Array(currPts.length).fill(false);
 
   try {
     const focalLength = Math.max(canvas.width, 1);
@@ -476,43 +394,42 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
       inlierMask
     );
 
-    // Validation gate before recoverPose.
     if (!essential || essential.empty() || essential.rows < 3 || essential.cols < 3) {
-      latestRelativeT = [0, 0, 0];
       motionActivity = "SKIP_NO_E";
-      return;
-    }
-    const eData = matData(essential);
-    if (!eData.length || !Number.isFinite(eData[0])) {
       latestRelativeT = [0, 0, 0];
-      motionActivity = "SKIP_BAD_E";
-      return;
+      return drawInliers;
     }
-    lastENorm = frobeniusNorm(eData);
 
-    const firstMaskData = matData(inlierMask);
-    const firstMaskLen = Math.min(firstMaskData.length, currPoints.length);
-    const inlierPrevPts = [];
-    const inlierCurrPts = [];
-    const inlierIndices = [];
-    for (let i = 0; i < currPoints.length; i++) {
-      const rawMaskValue = i < firstMaskLen ? firstMaskData[i] : 0;
-      const normalizedMaskValue = (rawMaskValue === 1 || rawMaskValue === 255) ? 1 : 0;
-      if (normalizedMaskValue === 1) {
-        inlierPrevPts.push(prevPoints[i]);
-        inlierCurrPts.push(currPoints[i]);
-        inlierIndices.push(i);
+    const eFirst = essential.data64F ? essential.data64F[0] : (essential.data32F ? essential.data32F[0] : NaN);
+    if (!Number.isFinite(eFirst)) {
+      motionActivity = "SKIP_BAD_E";
+      latestRelativeT = [0, 0, 0];
+      return drawInliers;
+    }
+    lastENorm = frobeniusNorm(matData(essential));
+
+    const rawMask = matData(inlierMask);
+    const firstInlierPrev = [];
+    const firstInlierCurr = [];
+    const firstInlierIndices = [];
+    for (let i = 0; i < currPts.length; i++) {
+      const maskValue = i < rawMask.length ? rawMask[i] : 0;
+      const isInlier = (maskValue === 1 || maskValue === 255);
+      if (isInlier) {
+        firstInlierPrev.push(prevPts[i]);
+        firstInlierCurr.push(currPts[i]);
+        firstInlierIndices.push(i);
       }
     }
 
-    if (inlierCurrPts.length < MIN_POSE_INLIERS) {
-      latestRelativeT = [0, 0, 0];
+    if (firstInlierCurr.length < MIN_POSE_INLIERS) {
       motionActivity = "SKIP_LOW_INLIERS";
-      return;
+      latestRelativeT = [0, 0, 0];
+      return drawInliers;
     }
 
-    inlierPrevMat = pointsToMat(inlierPrevPts);
-    inlierCurrMat = pointsToMat(inlierCurrPts);
+    inlierPrevMat = pointsToMat(firstInlierPrev);
+    inlierCurrMat = pointsToMat(firstInlierCurr);
     R = new cv.Mat();
     t = new cv.Mat();
 
@@ -527,41 +444,33 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
       poseMask
     );
 
-    const poseMaskData = matData(poseMask);
-    const poseMaskLen = Math.min(poseMaskData.length, inlierCurrPts.length);
-    const finalInlierFlags = new Array(currPoints.length).fill(false);
-    essentialInlierCount = 0;
-    for (let j = 0; j < inlierCurrPts.length; j++) {
-      const rawMaskValue = j < poseMaskLen ? poseMaskData[j] : 0;
-      const normalizedMaskValue = (rawMaskValue === 1 || rawMaskValue === 255) ? 1 : 0;
-      if (normalizedMaskValue === 1) {
-        finalInlierFlags[inlierIndices[j]] = true;
+    const recoveredMask = matData(poseMask);
+    for (let i = 0; i < firstInlierCurr.length; i++) {
+      const maskValue = i < recoveredMask.length ? recoveredMask[i] : 0;
+      const isInlier = (maskValue === 1 || maskValue === 255);
+      if (isInlier) {
+        drawInliers[firstInlierIndices[i]] = true;
         essentialInlierCount++;
       }
     }
 
-    for (let i = 0; i < currPoints.length; i++) {
-      inlierDrawPoints.push(currPoints[i]);
-      inlierDrawMask.push(finalInlierFlags[i]);
-    }
-
     if (essentialInlierCount < MIN_POSE_INLIERS) {
-      latestRelativeT = [0, 0, 0];
       motionActivity = "SKIP_POSE_INLIERS";
-      return;
+      latestRelativeT = [0, 0, 0];
+      return drawInliers;
     }
 
     const relativeR = readMat3x3(R);
     const relativeT = readMat3x1(t);
     if (!relativeR || !relativeT || !isFiniteVec(relativeR) || !isFiniteVec(relativeT)) {
-      latestRelativeT = [0, 0, 0];
       motionActivity = "SKIP_BAD_RT";
-      return;
+      latestRelativeT = [0, 0, 0];
+      return drawInliers;
     }
-    lastRDet = det3(relativeR);
 
     latestRelativeR = relativeR;
     latestRelativeT = relativeT;
+    lastRDet = det3(relativeR);
 
     const deltaMotion = Math.hypot(
       relativeT[0] - lastRelativeT[0],
@@ -583,9 +492,9 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
 
     const worldStep = multiplyMatVec3(globalR, relativeT);
     if (!isFiniteVec(worldStep)) {
-      latestRelativeT = [0, 0, 0];
       motionActivity = "SKIP_BAD_STEP";
-      return;
+      latestRelativeT = [0, 0, 0];
+      return drawInliers;
     }
     globalT[0] += worldStep[0];
     globalT[1] += worldStep[1];
@@ -596,21 +505,21 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
     if (trajectory.length === 0) {
       trajectory.push([globalT[0], globalT[1], globalT[2]]);
     } else {
-      const prevTraj = trajectory[trajectory.length - 1];
-      const stepNorm = Math.hypot(globalT[0] - prevTraj[0], globalT[1] - prevTraj[1], globalT[2] - prevTraj[2]);
-      if (stepNorm > 1e-4) {
+      const last = trajectory[trajectory.length - 1];
+      const step = Math.hypot(globalT[0] - last[0], globalT[1] - last[1], globalT[2] - last[2]);
+      if (step > 1e-4) {
         trajectory.push([globalT[0], globalT[1], globalT[2]]);
       }
     }
     if (trajectory.length > 1200) {
       trajectory.shift();
     }
+
+    return drawInliers;
   } catch (err) {
-    latestRelativeT = [0, 0, 0];
-    essentialInlierCount = 0;
-    inlierDrawPoints = [];
-    inlierDrawMask = [];
     motionActivity = "ERROR";
+    latestRelativeT = [0, 0, 0];
+    return drawInliers;
   } finally {
     prevPtsMat.delete();
     currPtsMat.delete();
@@ -646,6 +555,7 @@ function drawTrajectoryTopDown() {
     if (p[2] < minZ) minZ = p[2];
     if (p[2] > maxZ) maxZ = p[2];
   }
+
   const spanX = Math.max(maxX - minX, 1e-3);
   const spanZ = Math.max(maxZ - minZ, 1e-3);
   const scale = Math.min((maxDraw - minDraw) / spanX, (maxDraw - minDraw) / spanZ);
@@ -663,11 +573,8 @@ function drawTrajectoryTopDown() {
     const p = trajectory[i];
     const x = minDraw + ((p[0] - minX) * scale);
     const y = maxDraw - ((p[2] - minZ) * scale);
-    if (i === 0) {
-      ctx.moveTo(x, y);
-    } else {
-      ctx.lineTo(x, y);
-    }
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   }
   ctx.stroke();
 
@@ -681,14 +588,19 @@ function drawTrajectoryTopDown() {
 }
 
 function drawPoseDebugVisuals() {
-  if (inlierDrawPoints.length > 0) {
-    for (let i = 0; i < inlierDrawPoints.length; i++) {
-      const p = inlierDrawPoints[i];
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
-      ctx.fillStyle = inlierDrawMask[i] ? "#00ff66" : "#ff3b30";
-      ctx.fill();
-    }
+  for (let i = 0; i < matchDrawPairs.length; i++) {
+    const pair = matchDrawPairs[i];
+    ctx.strokeStyle = pair.isInlier ? "rgba(0, 255, 102, 0.35)" : "rgba(255, 59, 48, 0.28)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pair.prev.x, pair.prev.y);
+    ctx.lineTo(pair.curr.x, pair.curr.y);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(pair.curr.x, pair.curr.y, 2, 0, 2 * Math.PI);
+    ctx.fillStyle = pair.isInlier ? "#00ff66" : "#ff3b30";
+    ctx.fill();
   }
 
   const centerX = canvas.width * 0.5;
@@ -707,190 +619,133 @@ function drawPoseDebugVisuals() {
   drawTrajectoryTopDown();
 }
 
-/* ---------------- FRAME LOOP ---------------- */
 function processFrame() {
   if (!streaming) return;
 
   ensureFrameBufferSize();
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   src.data.set(imageData.data);
-
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-  if (reseedRequested || !prevGray || trackedPoints.length < MIN_POINTS) {
-    reseedFeatures(gray, reseedRequested ? "reseed" : "bootstrap");
-  } else {
-    const prevPtsMat = pointsToMat(trackedPoints);
-    const nextPtsMat = new cv.Mat();
-    const status = new cv.Mat();
-    const err = new cv.Mat();
+  const keypoints = new cv.KeyPointVector();
+  const descriptors = new cv.Mat();
 
-    cv.calcOpticalFlowPyrLK(
-      prevGray,
-      gray,
-      prevPtsMat,
-      nextPtsMat,
-      status,
-      err,
-      lkWinSize,
-      2,
-      lkCriteria
-    );
+  try {
+    orb.detect(gray, keypoints);
+    orb.compute(gray, keypoints, descriptors);
 
-    const candidates = [];
-    const statusLen = Math.min(status.rows * status.cols, trackedPoints.length);
-    const nextData = nextPtsMat.data32F || [];
-
-    for (let i = 0; i < statusLen; i++) {
-      if (status.data[i] !== 1) {
-        continue;
-      }
-      const nx = nextData[i * 2];
-      const ny = nextData[(i * 2) + 1];
-      const lkErr = err.data32F ? err.data32F[i] : 0;
-
-      if (
-        !Number.isFinite(nx) ||
-        !Number.isFinite(ny) ||
-        nx < 0 ||
-        ny < 0 ||
-        nx >= canvas.width ||
-        ny >= canvas.height ||
-        (Number.isFinite(lkErr) && lkErr > LK_ERR_MAX)
-      ) {
-        continue;
-      }
-
-      candidates.push({
-        raw: { x: nx, y: ny },
-        prev: trackedPoints[i],
-        prevDraw: smoothedDrawPoints[i]
-      });
+    const currPoints = [];
+    const kpSize = keypoints.size();
+    for (let i = 0; i < kpSize; i++) {
+      const kp = keypoints.get(i);
+      currPoints.push({ x: kp.pt.x, y: kp.pt.y });
     }
+    keypointCount = currPoints.length;
+    matchDrawPairs = [];
+    essentialInlierCount = 0;
+    matchCount = 0;
+    avgMatchDistance = 0;
 
-    const robustCandidates = [];
-    if (candidates.length > 0) {
-      const candidateMat = pointsToMat(candidates.map((c) => c.raw));
-      const backPtsMat = new cv.Mat();
-      const backStatus = new cv.Mat();
-      const backErr = new cv.Mat();
-
-      cv.calcOpticalFlowPyrLK(
-        gray,
-        prevGray,
-        candidateMat,
-        backPtsMat,
-        backStatus,
-        backErr,
-        lkWinSize,
-        2,
-        lkCriteria
-      );
-
-      const backData = backPtsMat.data32F || [];
-      for (let i = 0; i < candidates.length; i++) {
-        if (backStatus.data[i] !== 1) {
-          continue;
-        }
-
-        const bx = backData[i * 2];
-        const by = backData[(i * 2) + 1];
-        const reverseLkErr = backErr.data32F ? backErr.data32F[i] : 0;
-        if (
-          !Number.isFinite(bx) ||
-          !Number.isFinite(by) ||
-          (Number.isFinite(reverseLkErr) && reverseLkErr > LK_ERR_MAX)
-        ) {
-          continue;
-        }
-
-        const backtrackErr = Math.hypot(
-          bx - candidates[i].prev.x,
-          by - candidates[i].prev.y
-        );
-        if (backtrackErr > FB_ERR_MAX) {
-          continue;
-        }
-
-        robustCandidates.push(candidates[i]);
-      }
-
-      candidateMat.delete();
-      backPtsMat.delete();
-      backStatus.delete();
-      backErr.delete();
-    }
-
-    const nextPts = [];
-    const nextDraw = [];
-    const voPrevPoints = [];
-    const voCurrPoints = [];
-    if (robustCandidates.length > 0) {
-      const flowDists = [];
-      for (let i = 0; i < robustCandidates.length; i++) {
-        const c = robustCandidates[i];
-        flowDists.push(Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y));
-      }
-      const medFlow = median(flowDists);
-      const madLike = median(flowDists.map((d) => Math.abs(d - medFlow)));
-      const flowThreshold = Math.max(
-        FLOW_OUTLIER_BASE,
-        medFlow + (FLOW_OUTLIER_SCALE * (madLike + 0.15))
-      );
-
-      for (let i = 0; i < robustCandidates.length; i++) {
-        const c = robustCandidates[i];
-        const flow = Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y);
-        if (flow > flowThreshold) {
-          continue;
-        }
-        nextPts.push(c.raw);
-        nextDraw.push(smoothPoint(c.raw, c.prevDraw));
-        voPrevPoints.push(c.prev);
-        voCurrPoints.push(c.raw);
-      }
-    }
-
-    estimatePoseFromTracks(voPrevPoints, voCurrPoints);
-
-    if (reseedRequested || nextPts.length < MIN_POINTS) {
-      requestFeatureReseed(nextPts.length < MIN_POINTS ? "tracking_degenerate" : "pose_stall");
-      reseedFeatures(gray, "tracking_reset");
+    if (
+      reseedRequested ||
+      !prevDescriptors ||
+      !prevKeypoints ||
+      !prevDescriptors.data ||
+      prevDescriptors.rows === 0 ||
+      descriptors.rows === 0
+    ) {
+      resetMatcherState(reseedRequested ? "reseed" : "bootstrap");
+      if (prevDescriptors) prevDescriptors.delete();
+      prevDescriptors = descriptors.clone();
+      prevKeypoints = currPoints;
+      motionActivity = "BOOTSTRAP";
     } else {
-      trackedPoints = nextPts;
-      smoothedDrawPoints = nextDraw;
+      const matches = new cv.DMatchVector();
+      try {
+        bf.match(prevDescriptors, descriptors, matches);
+
+        const sorted = [];
+        for (let i = 0; i < matches.size(); i++) {
+          const m = matches.get(i);
+          if (
+            m.queryIdx >= 0 &&
+            m.queryIdx < prevKeypoints.length &&
+            m.trainIdx >= 0 &&
+            m.trainIdx < currPoints.length
+          ) {
+            sorted.push({
+              queryIdx: m.queryIdx,
+              trainIdx: m.trainIdx,
+              distance: m.distance
+            });
+          }
+        }
+        sorted.sort((a, b) => a.distance - b.distance);
+
+        const topMatches = sorted.slice(0, MAX_MATCHES);
+        let filteredMatches = topMatches;
+        if (topMatches.length > 0) {
+          const minDist = topMatches[0].distance;
+          const distThresh = Math.max(minDist * 2.5, 30);
+          const strong = topMatches.filter((m) => m.distance <= distThresh);
+          if (strong.length >= MIN_POSE_POINTS) {
+            filteredMatches = strong;
+          }
+        }
+
+        matchCount = filteredMatches.length;
+        if (matchCount > 0) {
+          let distSum = 0;
+          for (let i = 0; i < filteredMatches.length; i++) {
+            distSum += filteredMatches[i].distance;
+          }
+          avgMatchDistance = distSum / matchCount;
+        }
+
+        const prevPts = [];
+        const currPts = [];
+        for (let i = 0; i < filteredMatches.length; i++) {
+          const m = filteredMatches[i];
+          prevPts.push(prevKeypoints[m.queryIdx]);
+          currPts.push(currPoints[m.trainIdx]);
+        }
+
+        const inlierFlags = estimatePoseFromMatches(prevPts, currPts);
+        for (let i = 0; i < filteredMatches.length; i++) {
+          matchDrawPairs.push({
+            prev: prevPts[i],
+            curr: currPts[i],
+            isInlier: !!inlierFlags[i]
+          });
+        }
+      } finally {
+        matches.delete();
+      }
+
+      if (reseedRequested) {
+        resetMatcherState("pose_stall");
+      }
+
+      if (prevDescriptors) prevDescriptors.delete();
+      prevDescriptors = descriptors.clone();
+      prevKeypoints = currPoints;
     }
-
-    prevPtsMat.delete();
-    nextPtsMat.delete();
-    status.delete();
-    err.delete();
-
-  }
-
-  for (let i = 0; i < smoothedDrawPoints.length; i++) {
-    const p = smoothedDrawPoints[i];
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
-    ctx.fillStyle = "rgba(170, 255, 170, 0.25)";
-    ctx.fill();
+  } catch (err) {
+    motionActivity = "ERROR";
+    requestFeatureReseed("frame_error");
+    resetMatcherState("frame_error");
+  } finally {
+    keypoints.delete();
+    descriptors.delete();
   }
 
   drawPoseDebugVisuals();
   updateDebugOverlay();
 
-  if (prevGray) {
-    prevGray.delete();
-  }
-  prevGray = gray.clone();
-
   requestAnimationFrame(processFrame);
 }
 
-/* ---------------- INIT ---------------- */
 async function init() {
   statusText.textContent = "Starting camera...";
   await startCamera();
@@ -898,24 +753,30 @@ async function init() {
   await waitForCV();
 
   updateCanvasSize();
-
   src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
   gray = new cv.Mat();
-  lkWinSize = new cv.Size(21, 21);
-  lkCriteria = new cv.TermCriteria(
-    cv.TermCriteria_EPS + cv.TermCriteria_COUNT,
-    30,
-    0.01
-  );
 
+  orb = new cv.ORB(MAX_ORB_FEATURES);
+  if (orb.setMaxFeatures) {
+    orb.setMaxFeatures(MAX_ORB_FEATURES);
+  }
+  bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+
+  resetMatcherState("init");
   streaming = true;
-  statusText.textContent = "Tracking points...";
+  statusText.textContent = "ORB VO running...";
   requestAnimationFrame(processFrame);
 }
 
-window.addEventListener("resize", updateCanvasSize);
+window.addEventListener("resize", () => {
+  updateCanvasSize();
+  requestFeatureReseed("resize");
+});
 window.addEventListener("orientationchange", () => {
-  setTimeout(updateCanvasSize, 120);
+  setTimeout(() => {
+    updateCanvasSize();
+    requestFeatureReseed("orientation");
+  }, 120);
 });
 
 startButton.addEventListener("click", async () => {
