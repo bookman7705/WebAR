@@ -191,6 +191,10 @@
     let hasStarted = false;
     let modules = null;
     let shouldPlaceModel = false;
+    const TRACKING_SMOOTHING = 0.2;
+    const PLANE_SMOOTHING = 0.35;
+    const PLANE_SAMPLES_REQUIRED = 12;
+    const MAX_PLANE_POSITION_SPREAD = 0.12;
 
     async function importFirstAvailable(paths, label) {
       const failures = [];
@@ -289,7 +293,7 @@
       statusValueEl.textContent = `Initializing / lost tracking (features: ${pointsCount})`;
       rotationValueEl.textContent = "--";
       translationValueEl.textContent = "--";
-       planeValueEl.textContent = "No stable plane yet";
+      planeValueEl.textContent = "No stable plane yet";
       poseMatrixValueEl.textContent = "Pose matrix unavailable";
     }
 
@@ -352,7 +356,25 @@
         });
 
         const modelRoot = gltf.scene;
-        modelRoot.scale.set(0.2, 0.2, 0.2);
+        const modelBounds = new THREE.Box3().setFromObject(modelRoot);
+        const modelSize = new THREE.Vector3();
+        modelBounds.getSize(modelSize);
+
+        // Normalize GLB to a practical AR height so tiny/huge source files are corrected.
+        if (modelSize.y > 0.0001) {
+          const targetHeightMeters = 0.35;
+          const uniformScale = targetHeightMeters / modelSize.y;
+          modelRoot.scale.setScalar(uniformScale);
+        }
+
+        // Recompute and rebase so the model stands on the detected plane.
+        const rebasedBounds = new THREE.Box3().setFromObject(modelRoot);
+        const rebasedCenter = new THREE.Vector3();
+        rebasedBounds.getCenter(rebasedCenter);
+        modelRoot.position.x -= rebasedCenter.x;
+        modelRoot.position.z -= rebasedCenter.z;
+        modelRoot.position.y -= rebasedBounds.min.y;
+
         modelRoot.traverse((node) => {
           if (node.isMesh) {
             node.castShadow = false;
@@ -365,10 +387,10 @@
       } catch (error) {
         // Fallback mesh allows AR pipeline testing when no GLB is present.
         const fallback = new THREE.Mesh(
-          new THREE.BoxGeometry(0.15, 0.15, 0.15),
+          new THREE.BoxGeometry(0.35, 0.35, 0.35),
           new THREE.MeshNormalMaterial({ flatShading: true })
         );
-        fallback.position.y = 0.075;
+        fallback.position.y = 0.175;
         planeValueEl.textContent = `GLB missing, using fallback cube (${modelUrl})`;
         return fallback;
       }
@@ -443,8 +465,54 @@
         modelAnchor.visible = false;
         scene.add(modelAnchor);
 
+        const trackedCamPosition = new THREE.Vector3();
+        const trackedCamQuaternion = new THREE.Quaternion();
+        const planePosition = new THREE.Vector3();
+        const planeQuaternion = new THREE.Quaternion();
+        const rawPosePosition = new THREE.Vector3();
+        const rawPoseQuaternion = new THREE.Quaternion();
+        const placementSamples = [];
+        let hasCameraPose = false;
+        let hasPlanePose = false;
+
+        function averageSamples(samples) {
+          const avgPosition = new THREE.Vector3();
+          const avgQuaternion = new THREE.Quaternion(0, 0, 0, 0);
+          let reference = null;
+
+          for (const sample of samples) {
+            avgPosition.add(sample.position);
+
+            const q = sample.quaternion.clone();
+            if (reference === null) {
+              reference = q.clone();
+            } else if (reference.dot(q) < 0) {
+              q.multiplyScalar(-1);
+            }
+
+            avgQuaternion.x += q.x;
+            avgQuaternion.y += q.y;
+            avgQuaternion.z += q.z;
+            avgQuaternion.w += q.w;
+          }
+
+          avgPosition.multiplyScalar(1 / samples.length);
+          avgQuaternion.normalize();
+
+          return { position: avgPosition, quaternion: avgQuaternion };
+        }
+
+        function computePositionSpread(samples, center) {
+          let spread = 0;
+          for (const sample of samples) {
+            spread = Math.max(spread, sample.position.distanceTo(center));
+          }
+          return spread;
+        }
+
         app.addEventListener("pointerdown", () => {
           shouldPlaceModel = true;
+          placementSamples.length = 0;
           planeValueEl.textContent = "Tap registered, waiting for plane...";
         });
 
@@ -475,28 +543,74 @@
 
           if (pose) {
             updateHUDWithPose(pose);
-            applyPose(pose, arCamera.quaternion, arCamera.position);
+            applyPose(pose, rawPoseQuaternion, rawPosePosition);
+
+            if (!hasCameraPose) {
+              trackedCamPosition.copy(rawPosePosition);
+              trackedCamQuaternion.copy(rawPoseQuaternion);
+              hasCameraPose = true;
+            } else {
+              trackedCamPosition.lerp(rawPosePosition, TRACKING_SMOOTHING);
+              trackedCamQuaternion.slerp(rawPoseQuaternion, TRACKING_SMOOTHING);
+            }
+
+            arCamera.position.copy(trackedCamPosition);
+            arCamera.quaternion.copy(trackedCamQuaternion);
 
             const planePose = alva.findPlane();
 
             if (planePose) {
+              applyPose(planePose, rawPoseQuaternion, rawPosePosition);
+
+              if (!hasPlanePose) {
+                planePosition.copy(rawPosePosition);
+                planeQuaternion.copy(rawPoseQuaternion);
+                hasPlanePose = true;
+              } else {
+                planePosition.lerp(rawPosePosition, PLANE_SMOOTHING);
+                planeQuaternion.slerp(rawPoseQuaternion, PLANE_SMOOTHING);
+              }
+
               reticle.visible = true;
-              applyPose(planePose, reticle.quaternion, reticle.position);
+              reticle.position.copy(planePosition);
+              reticle.quaternion.copy(planeQuaternion);
+
               planeValueEl.textContent = shouldPlaceModel
-                ? "Plane detected - placing model..."
+                ? "Plane detected - stabilizing anchor..."
                 : "Plane detected (tap to place model)";
 
               if (shouldPlaceModel) {
-                modelAnchor.clear();
-                const instance = modelTemplate.clone(true);
-                modelAnchor.add(instance);
-                applyPose(planePose, modelAnchor.quaternion, modelAnchor.position);
-                modelAnchor.visible = true;
-                shouldPlaceModel = false;
-                planeValueEl.textContent = "Model placed on horizontal plane";
+                placementSamples.push({
+                  position: planePosition.clone(),
+                  quaternion: planeQuaternion.clone(),
+                });
+
+                if (placementSamples.length > PLANE_SAMPLES_REQUIRED) {
+                  placementSamples.shift();
+                }
+
+                if (placementSamples.length === PLANE_SAMPLES_REQUIRED) {
+                  const averaged = averageSamples(placementSamples);
+                  const spread = computePositionSpread(placementSamples, averaged.position);
+
+                  if (spread <= MAX_PLANE_POSITION_SPREAD) {
+                    modelAnchor.clear();
+                    const instance = modelTemplate.clone(true);
+                    modelAnchor.add(instance);
+                    modelAnchor.position.copy(averaged.position);
+                    modelAnchor.quaternion.copy(averaged.quaternion);
+                    modelAnchor.visible = true;
+                    shouldPlaceModel = false;
+                    placementSamples.length = 0;
+                    planeValueEl.textContent = "Model anchored on stable horizontal plane";
+                  } else {
+                    planeValueEl.textContent = "Plane unstable, hold phone steady and keep scanning...";
+                  }
+                }
               }
             } else {
               reticle.visible = false;
+              hasPlanePose = false;
               if (shouldPlaceModel) {
                 planeValueEl.textContent = "No plane yet, keep moving camera slowly...";
               } else {
@@ -507,6 +621,7 @@
             const points = alva.getFramePoints();
             updateHUDAwaitingTracking(points.length);
             reticle.visible = false;
+            hasPlanePose = false;
           }
 
           renderer.render(scene, arCamera);
