@@ -175,14 +175,41 @@
     let hasStarted = false;
     let modules = null;
 
+    async function importFirstAvailable(paths, label) {
+      const failures = [];
+
+      for (const path of paths) {
+        try {
+          const mod = await import(path);
+          return { mod, path };
+        } catch (error) {
+          const reason = (error && error.message) ? error.message : String(error);
+          failures.push(`${path} -> ${reason}`);
+        }
+      }
+
+      throw new Error(`${label} import failed.\n${failures.join("\n")}`);
+    }
+
     async function ensureModulesLoaded() {
       if (modules) {
         return modules;
       }
 
-      const [alvaModule, utilsModule] = await Promise.all([
-        import("./AlvaAR-main/examples/public/assets/alva_ar.js"),
-        import("./AlvaAR-main/examples/public/assets/utils.js"),
+      const alvaCandidates = [
+        "./AlvaAR/examples/public/assets/alva_ar.js",
+        "./AlvaAR/dist/alva_ar.js",
+        "https://alanross.github.io/AlvaAR/examples/public/assets/alva_ar.js",
+      ];
+
+      const utilsCandidates = [
+        "./AlvaAR/examples/public/assets/utils.js",
+        "https://alanross.github.io/AlvaAR/examples/public/assets/utils.js",
+      ];
+
+      const [{ mod: alvaModule }, { mod: utilsModule }] = await Promise.all([
+        importFirstAvailable(alvaCandidates, "AlvaAR module"),
+        importFirstAvailable(utilsCandidates, "Utils module"),
       ]);
 
       modules = {
@@ -319,7 +346,7 @@
         const message = (error && error.message) ? error.message : String(error);
         statusValueEl.textContent = `Failed to start: ${message}`;
         startButtonEl.disabled = false;
-        startButtonEl.textContent = "Start Camera SLAM";
+        startButtonEl.textContent = "Start Camera Pose";
         alert(
           `Could not start AR SLAM camera.\n\n${message}\n\nTip: serve this page from http://localhost or https:// (not file://).`
         );
