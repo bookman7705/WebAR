@@ -191,10 +191,13 @@
     let hasStarted = false;
     let modules = null;
     let shouldPlaceModel = false;
-    const TRACKING_SMOOTHING = 0.2;
+    const SLAM_FOV_DEGREES = 45;
+    const TRACKING_SMOOTHING = 0.1;
     const PLANE_SMOOTHING = 0.35;
     const PLANE_SAMPLES_REQUIRED = 12;
     const MAX_PLANE_POSITION_SPREAD = 0.12;
+    const POSE_MAX_TRANSLATION_JUMP = 0.2;
+    const POSE_MAX_ANGLE_JUMP_RAD = Math.PI * 0.2;
 
     async function importFirstAvailable(paths, label) {
       const failures = [];
@@ -295,6 +298,11 @@
       translationValueEl.textContent = "--";
       planeValueEl.textContent = "No stable plane yet";
       poseMatrixValueEl.textContent = "Pose matrix unavailable";
+    }
+
+    function quaternionAngularDistance(a, b) {
+      const dot = Math.min(1, Math.max(-1, Math.abs(a.dot(b))));
+      return 2 * Math.acos(dot);
     }
 
     async function openCameraStream() {
@@ -429,7 +437,7 @@
         const ctx = canvasEl.getContext("2d", { alpha: false, desynchronized: true });
 
         statusValueEl.textContent = "Loading SLAM engine...";
-        const alva = await AlvaAR.Initialize(canvasEl.width, canvasEl.height);
+        const alva = await AlvaAR.Initialize(canvasEl.width, canvasEl.height, SLAM_FOV_DEGREES);
         const applyPose = AlvaARConnectorTHREE.Initialize(THREE);
 
         const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -440,7 +448,12 @@
         app.appendChild(renderer.domElement);
 
         const scene = new THREE.Scene();
-        const arCamera = new THREE.PerspectiveCamera(75, app.clientWidth / app.clientHeight, 0.01, 1000);
+        const arCamera = new THREE.PerspectiveCamera(
+          SLAM_FOV_DEGREES,
+          app.clientWidth / app.clientHeight,
+          0.01,
+          1000
+        );
         arCamera.rotation.reorder("YXZ");
         arCamera.updateProjectionMatrix();
         scene.add(arCamera);
@@ -474,6 +487,7 @@
         const placementSamples = [];
         let hasCameraPose = false;
         let hasPlanePose = false;
+        let rejectedPoseFrames = 0;
 
         function averageSamples(samples) {
           const avgPosition = new THREE.Vector3();
@@ -550,8 +564,26 @@
               trackedCamQuaternion.copy(rawPoseQuaternion);
               hasCameraPose = true;
             } else {
-              trackedCamPosition.lerp(rawPosePosition, TRACKING_SMOOTHING);
-              trackedCamQuaternion.slerp(rawPoseQuaternion, TRACKING_SMOOTHING);
+              const translationJump = trackedCamPosition.distanceTo(rawPosePosition);
+              const rotationJump = quaternionAngularDistance(trackedCamQuaternion, rawPoseQuaternion);
+
+              if (translationJump > POSE_MAX_TRANSLATION_JUMP || rotationJump > POSE_MAX_ANGLE_JUMP_RAD) {
+                rejectedPoseFrames += 1;
+
+                // Ignore sporadic large jumps that make anchored content snap.
+                if (rejectedPoseFrames <= 6) {
+                  planeValueEl.textContent = "Filtering tracking spike...";
+                } else {
+                  // If jumps persist for several frames, resync to avoid getting stuck.
+                  trackedCamPosition.copy(rawPosePosition);
+                  trackedCamQuaternion.copy(rawPoseQuaternion);
+                  rejectedPoseFrames = 0;
+                }
+              } else {
+                rejectedPoseFrames = 0;
+                trackedCamPosition.lerp(rawPosePosition, TRACKING_SMOOTHING);
+                trackedCamQuaternion.slerp(rawPoseQuaternion, TRACKING_SMOOTHING);
+              }
             }
 
             arCamera.position.copy(trackedCamPosition);
