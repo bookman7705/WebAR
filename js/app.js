@@ -13,7 +13,9 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 
 let loopStarted = false;
-const trackingData = {
+const TRACK_INTERVAL_MS = 100; // 10 FPS tracking updates; rendering remains per-frame.
+let lastTrackTime = 0;
+let trackingData = {
   loading: true,
   trackedCount: 0,
   trackedPoints: [],
@@ -33,7 +35,7 @@ function startRenderLoop() {
   processFrame();
 }
 
-function processFrame() {
+function processFrame(timestamp) {
   const video = getVideo();
   if (!video) {
     requestAnimationFrame(processFrame);
@@ -58,11 +60,23 @@ function processFrame() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    // Tracking updates continuously in the frame loop; button only forces a reset.
-    const frameTrackingData = processTrackingFrame(canvas, {
-      forceRedetect: consumeRedetectRequest()
-    });
-    Object.assign(trackingData, frameTrackingData);
+    const frameTime = Number.isFinite(timestamp) ? timestamp : performance.now();
+    const shouldUpdateTracking = (frameTime - lastTrackTime) >= TRACK_INTERVAL_MS;
+
+    // Centralized tracking update source: only app loop updates trackingData.
+    if (shouldUpdateTracking) {
+      const frameTrackingData = processTrackingFrame(canvas, {
+        forceRedetect: consumeRedetectRequest()
+      });
+      // Atomic replacement to avoid partial mid-frame mutations/jitter.
+      trackingData = {
+        ...trackingData,
+        ...frameTrackingData,
+        trackedPoints: [...(frameTrackingData.trackedPoints || [])],
+        prevPoints: [...(frameTrackingData.prevPoints || [])]
+      };
+      lastTrackTime = frameTime;
+    }
 
     drawTracking(
       ctx,
