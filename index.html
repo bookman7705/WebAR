@@ -92,7 +92,8 @@ let voStats = {
   recoverOk: 0,
   updates: 0,
   lastInliers: 0,
-  lastTNorm: 0
+  lastTNorm: 0,
+  lastErr: ""
 };
 
 const MAX_POINTS = 180;
@@ -215,6 +216,14 @@ function pointsToMat(points) {
   return cv.matFromArray(points.length, 1, cv.CV_32FC2, flat);
 }
 
+function pointsToMatNx2F64(points) {
+  const flat = [];
+  for (let i = 0; i < points.length; i++) {
+    flat.push(points[i].x, points[i].y);
+  }
+  return cv.matFromArray(points.length, 2, cv.CV_64F, flat);
+}
+
 function smoothPoint(current, previous) {
   if (!previous) {
     return { x: current.x, y: current.y };
@@ -256,8 +265,8 @@ function estimateMotion(prevPts, currPts) {
   }
   voStats.attempts += 1;
 
-  const prevMat = pointsToMat(prevPts);
-  const currMat = pointsToMat(currPts);
+  const prevMat = pointsToMatNx2F64(prevPts);
+  const currMat = pointsToMatNx2F64(currPts);
 
   // Approximate intrinsics from frame dimensions.
   const fx = 0.8 * canvas.width;
@@ -271,55 +280,16 @@ function estimateMotion(prevPts, currPts) {
     0, 0, 1
   ]);
 
-  const E = new cv.Mat();
   const inlierMask = new cv.Mat();
 
   let updated = false;
-  let essential = new cv.Mat();
   try {
-    // OpenCV.js builds differ by signature; try common forms in order.
-    try {
-      const maybeE = cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0);
-      if (maybeE && typeof maybeE.delete === "function" && typeof maybeE.empty === "function") {
-        if (!maybeE.empty()) {
-          maybeE.copyTo(essential);
-        }
-        maybeE.delete();
-      }
-    } catch (_) {
-      // try fallback signatures below
-    }
-
-    if (essential.empty()) {
-      try {
-        const maybeE = cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, 1000, inlierMask);
-        if (maybeE && typeof maybeE.delete === "function" && typeof maybeE.empty === "function") {
-          if (!maybeE.empty()) {
-            maybeE.copyTo(essential);
-          }
-          maybeE.delete();
-        }
-      } catch (_) {
-        // try next signature
-      }
-    }
-
-    if (essential.empty()) {
-      try {
-        cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask, E);
-        if (!E.empty()) {
-          E.copyTo(essential);
-        }
-      } catch (_) {
-        // no-op
-      }
-    }
-
+    const essential = cv.findEssentialMat(prevMat, currMat, K, cv.RANSAC, 0.999, 1.5, inlierMask);
     if (essential && !essential.empty()) {
       voStats.essentialOk += 1;
       const R = new cv.Mat();
       const t = new cv.Mat();
-      const inliers = cv.recoverPose(essential, currMat, prevMat, K, R, t, inlierMask);
+      const inliers = cv.recoverPose(essential, prevMat, currMat, K, R, t, inlierMask);
       voStats.lastInliers = Number.isFinite(inliers) ? inliers : 0;
       voStats.recoverOk += 1;
 
@@ -361,15 +331,16 @@ function estimateMotion(prevPts, currPts) {
       R.delete();
       t.delete();
     }
-  } catch (_) {
-    // Skip this frame if epipolar geometry fails.
+    if (essential) {
+      essential.delete();
+    }
+  } catch (err) {
+    voStats.lastErr = err && err.message ? err.message : "vo-solve-failed";
   }
 
   prevMat.delete();
   currMat.delete();
   K.delete();
-  E.delete();
-  essential.delete();
   inlierMask.delete();
   return updated;
 }
@@ -565,8 +536,9 @@ function processFrame() {
     const tx = globalT.data64F[0];
     const ty = globalT.data64F[1];
     const tz = globalT.data64F[2];
+    const errTag = voStats.lastErr ? ` err:${voStats.lastErr.slice(0, 24)}` : "";
     statusText.textContent =
-      `Pts:${trackedPoints.length} step:${lastStepNorm.toFixed(5)} tN:${voStats.lastTNorm.toFixed(5)} inl:${voStats.lastInliers} upd:${voStats.updates}/${voStats.attempts} | T:${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
+      `Pts:${trackedPoints.length} step:${lastStepNorm.toFixed(5)} tN:${voStats.lastTNorm.toFixed(5)} inl:${voStats.lastInliers} E:${voStats.essentialOk} R:${voStats.recoverOk} upd:${voStats.updates}/${voStats.attempts}${errTag} | T:${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
   } else {
     statusText.textContent = `Pts: ${trackedPoints.length} | VO initializing...`;
   }
@@ -601,7 +573,8 @@ async function init() {
     recoverOk: 0,
     updates: 0,
     lastInliers: 0,
-    lastTNorm: 0
+    lastTNorm: 0,
+    lastErr: ""
   };
 
   streaming = true;
