@@ -1,654 +1,309 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Web AR SLAM Starter</title>
-
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"
+  />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>Web AR SLAM Pose Viewer</title>
   <style>
-    body {
+    * {
+      box-sizing: border-box;
       margin: 0;
-      overflow: hidden;
-      background: black;
+      padding: 0;
     }
 
-    video, canvas {
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #e6e6e6;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    #app {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      touch-action: none;
+    }
+
+    #camera {
       position: absolute;
       top: 0;
       left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      z-index: 0;
+      background: #000;
     }
 
-    #startOverlay {
-      position: fixed;
+    #processCanvas {
+      position: absolute;
       inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
+      opacity: 0;
+    }
+
+    #hud {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      right: 12px;
+      max-width: 560px;
+      z-index: 2;
+      background: rgba(0, 0, 0, 0.62);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 10px;
+      padding: 12px;
+      backdrop-filter: blur(3px);
+    }
+
+    .row {
       display: flex;
+      gap: 8px;
+      align-items: baseline;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+
+    .label {
+      color: #9eb9ff;
+      font-size: 12px;
+      min-width: 92px;
+    }
+
+    .value {
+      font-size: 14px;
+      color: #f4f7ff;
+      word-break: break-word;
+    }
+
+    pre {
+      margin-top: 8px;
+      font-size: 12px;
+      line-height: 1.3;
+      color: #d6ffd9;
+      white-space: pre;
+      overflow-x: auto;
+    }
+
+    #overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 3;
+      background: rgba(0, 0, 0, 0.82);
+      display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
-      background: rgba(0, 0, 0, 0.75);
-      z-index: 10;
+      gap: 14px;
+      padding: 24px;
+      text-align: center;
+    }
+
+    #overlay p {
+      max-width: 560px;
+      color: #c8c8c8;
+      line-height: 1.4;
+      font-size: 14px;
     }
 
     #startButton {
-      padding: 12px 18px;
-      border: 1px solid #2f2f2f;
-      border-radius: 10px;
-      background: #111;
+      border: 1px solid #fff;
       color: #fff;
-      font-size: 16px;
+      background: transparent;
+      border-radius: 8px;
+      padding: 12px 18px;
+      font-size: 14px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
       cursor: pointer;
     }
-
-    #statusText {
-      position: fixed;
-      left: 10px;
-      bottom: 10px;
-      color: #e5e5e5;
-      font-family: sans-serif;
-      font-size: 12px;
-      z-index: 11;
-      background: rgba(0, 0, 0, 0.35);
-      padding: 6px 8px;
-      border-radius: 6px;
-    }
   </style>
-
-  <script src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
-
 <body>
+  <div id="app">
+    <video id="camera" autoplay muted playsinline webkit-playsinline></video>
+    <canvas id="processCanvas"></canvas>
 
-<div id="startOverlay">
-  <button id="startButton" type="button">Start AR Camera</button>
-</div>
-<div id="statusText">Tap "Start AR Camera" to begin.</div>
+    <div id="hud">
+      <div class="row">
+        <span class="label">Status:</span>
+        <span class="value" id="statusValue">Waiting to start</span>
+      </div>
+      <div class="row">
+        <span class="label">Rotation:</span>
+        <span class="value" id="rotationValue">--</span>
+      </div>
+      <div class="row">
+        <span class="label">Translation:</span>
+        <span class="value" id="translationValue">--</span>
+      </div>
+      <pre id="poseMatrixValue">Pose matrix unavailable</pre>
+    </div>
 
-<video id="video" autoplay muted playsinline webkit-playsinline></video>
-<canvas id="canvas"></canvas>
+    <div id="overlay">
+      <button id="startButton" type="button">Start Camera SLAM</button>
+      <p>
+        Open this page over HTTPS or localhost, grant camera permission, and the
+        estimated camera pose (rotation + translation) will be shown live.
+      </p>
+    </div>
+  </div>
 
-<script>
-let video = document.getElementById("video");
-let canvas = document.getElementById("canvas");
-let ctx = canvas.getContext("2d");
-let startOverlay = document.getElementById("startOverlay");
-let startButton = document.getElementById("startButton");
-let statusText = document.getElementById("statusText");
+  <script type="module">
+    import { AlvaAR } from "./AlvaAR-main/examples/public/assets/alva_ar.js";
+    import { Camera, onFrame, resize2cover } from "./AlvaAR-main/examples/public/assets/utils.js";
 
-let streaming = false;
+    const app = document.getElementById("app");
+    const videoEl = document.getElementById("camera");
+    const canvasEl = document.getElementById("processCanvas");
+    const overlayEl = document.getElementById("overlay");
+    const startButtonEl = document.getElementById("startButton");
 
-let src, gray;
-let prevGray = null;
-let trackedPoints = [];
-let smoothedDrawPoints = [];
-let prevTrackedPoints = [];
+    const statusValueEl = document.getElementById("statusValue");
+    const rotationValueEl = document.getElementById("rotationValue");
+    const translationValueEl = document.getElementById("translationValue");
+    const poseMatrixValueEl = document.getElementById("poseMatrixValue");
+    let hasStarted = false;
 
-// Monocular VO pose (scale-ambiguous translation)
-let globalR = null;
-let globalT = null;
-let smoothedStepT = [0, 0, 0];
-let lastStepNorm = 0;
-let voStats = {
-  attempts: 0,
-  essentialOk: 0,
-  recoverOk: 0,
-  updates: 0,
-  lastInliers: 0,
-  lastTNorm: 0,
-  lastErr: "",
-  mode: "init"
-};
+    const formatNumber = (value) => (Number.isFinite(value) ? value.toFixed(4) : "NaN");
 
-const MAX_POINTS = 180;
-const MIN_POINTS = 60;
-let lkWinSize = null;
-let lkCriteria = null;
-const DRAW_SMOOTH_ALPHA = 0.5;
-const PIXEL_DEADZONE = 0.0;
-const LK_ERR_MAX = 18;
-const FB_ERR_MAX = 1.8;
-const FLOW_OUTLIER_BASE = 2.8;
-const FLOW_OUTLIER_SCALE = 2.4;
-const REFILL_BLOCK_RADIUS = 10;
-const VO_STEP_SMOOTH_ALPHA = 0.35;
-
-/* ---------------- CAMERA ---------------- */
-async function startCamera() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error("Camera API is not available in this browser.");
-  }
-
-  const constraintsToTry = [
-    { video: { facingMode: { exact: "environment" } }, audio: false },
-    { video: { facingMode: "environment" }, audio: false },
-    { video: true, audio: false }
-  ];
-
-  let stream = null;
-  let lastError = null;
-  for (let i = 0; i < constraintsToTry.length; i++) {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia(constraintsToTry[i]);
-      break;
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  if (!stream) {
-    throw lastError || new Error("Unable to access camera.");
-  }
-
-  video.srcObject = stream;
-  video.setAttribute("playsinline", "true");
-  video.setAttribute("webkit-playsinline", "true");
-  video.muted = true;
-
-  return new Promise(resolve => {
-    video.onloadedmetadata = () => {
-      video.play().catch(() => {});
-      resolve();
-    };
-  });
-}
-
-/* ---------------- WAIT FOR OPENCV ---------------- */
-function waitForCV() {
-  return new Promise(resolve => {
-    const check = () => {
-      if (typeof cv !== "undefined" && cv.Mat) {
-        resolve();
-      } else {
-        setTimeout(check, 50);
-      }
-    };
-    check();
-  });
-}
-
-function detectFeatures(grayMat, maxCorners = MAX_POINTS, blockedPoints = [], blockRadius = REFILL_BLOCK_RADIUS) {
-  const corners = new cv.Mat();
-  const mask = new cv.Mat(grayMat.rows, grayMat.cols, cv.CV_8UC1, new cv.Scalar(255));
-
-  for (let i = 0; i < blockedPoints.length; i++) {
-    const p = blockedPoints[i];
-    if (
-      !Number.isFinite(p.x) ||
-      !Number.isFinite(p.y) ||
-      p.x < 0 ||
-      p.y < 0 ||
-      p.x >= grayMat.cols ||
-      p.y >= grayMat.rows
-    ) {
-      continue;
-    }
-    cv.circle(
-      mask,
-      new cv.Point(Math.round(p.x), Math.round(p.y)),
-      blockRadius,
-      new cv.Scalar(0),
-      -1
-    );
-  }
-
-  cv.goodFeaturesToTrack(
-    grayMat,
-    corners,
-    maxCorners,
-    0.01,
-    8,
-    mask
-  );
-
-  const points = [];
-  const data = corners.data32F || [];
-  for (let i = 0; i + 1 < data.length; i += 2) {
-    points.push({ x: data[i], y: data[i + 1] });
-  }
-
-  corners.delete();
-  mask.delete();
-  return points;
-}
-
-function pointsToMat(points) {
-  const flat = [];
-  for (let i = 0; i < points.length; i++) {
-    flat.push(points[i].x, points[i].y);
-  }
-  return cv.matFromArray(points.length, 1, cv.CV_32FC2, flat);
-}
-
-function pointsToMatNx2F64(points) {
-  const flat = [];
-  for (let i = 0; i < points.length; i++) {
-    flat.push(points[i].x, points[i].y);
-  }
-  return cv.matFromArray(points.length, 2, cv.CV_64F, flat);
-}
-
-function smoothPoint(current, previous) {
-  if (!previous) {
-    return { x: current.x, y: current.y };
-  }
-
-  const dx = current.x - previous.x;
-  const dy = current.y - previous.y;
-  const dist = Math.hypot(dx, dy);
-
-  if (dist < PIXEL_DEADZONE) {
-    return { x: previous.x, y: previous.y };
-  }
-
-  return {
-    x: (DRAW_SMOOTH_ALPHA * current.x) + ((1 - DRAW_SMOOTH_ALPHA) * previous.x),
-    y: (DRAW_SMOOTH_ALPHA * current.y) + ((1 - DRAW_SMOOTH_ALPHA) * previous.y)
-  };
-}
-
-function median(values) {
-  if (!values.length) return 0;
-  const sorted = values.slice().sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0
-    ? (sorted[mid - 1] + sorted[mid]) * 0.5
-    : sorted[mid];
-}
-
-function updateCanvasSize() {
-  const w = video.videoWidth || window.innerWidth;
-  const h = video.videoHeight || window.innerHeight;
-  canvas.width = w;
-  canvas.height = h;
-}
-
-function estimateMotion(prevPts, currPts) {
-  if (!prevPts || !currPts || prevPts.length < 8 || currPts.length < 8) {
-    return false;
-  }
-  voStats.attempts += 1;
-
-  // Fallback path for OpenCV.js builds without calib3d VO APIs.
-  if (typeof cv.findEssentialMat !== "function" || typeof cv.recoverPose !== "function") {
-    voStats.mode = "flow";
-    voStats.lastErr = "";
-    voStats.lastInliers = currPts.length;
-    voStats.essentialOk = 0;
-    voStats.recoverOk = 0;
-
-    const dxs = [];
-    const dys = [];
-    const mags = [];
-    const n = Math.min(prevPts.length, currPts.length);
-    for (let i = 0; i < n; i++) {
-      const dx = currPts[i].x - prevPts[i].x;
-      const dy = currPts[i].y - prevPts[i].y;
-      dxs.push(dx);
-      dys.push(dy);
-      mags.push(Math.hypot(dx, dy));
+    function matrixToText(pose) {
+      return [
+        `${formatNumber(pose[0])}  ${formatNumber(pose[1])}  ${formatNumber(pose[2])}  ${formatNumber(pose[3])}`,
+        `${formatNumber(pose[4])}  ${formatNumber(pose[5])}  ${formatNumber(pose[6])}  ${formatNumber(pose[7])}`,
+        `${formatNumber(pose[8])}  ${formatNumber(pose[9])}  ${formatNumber(pose[10])}  ${formatNumber(pose[11])}`,
+        `${formatNumber(pose[12])}  ${formatNumber(pose[13])}  ${formatNumber(pose[14])}  ${formatNumber(pose[15])}`,
+      ].join("\n");
     }
 
-    const medDx = median(dxs);
-    const medDy = median(dys);
-    const medMag = median(mags);
+    function rotationFromPose(pose) {
+      return [
+        [pose[0], pose[1], pose[2]],
+        [pose[4], pose[5], pose[6]],
+        [pose[8], pose[9], pose[10]],
+      ];
+    }
 
-    // Pseudo-VO (2D translation proxy + small forward term).
-    const sx = medDx / Math.max(canvas.width, 1);
-    const sy = medDy / Math.max(canvas.height, 1);
-    const sz = -medMag / Math.max(canvas.width, 1);
-    const tNorm = Math.hypot(sx, sy, sz);
-    voStats.lastTNorm = tNorm;
+    function translationFromPose(pose) {
+      return [pose[12], pose[13], pose[14]];
+    }
 
-    smoothedStepT[0] = (VO_STEP_SMOOTH_ALPHA * sx) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[0]);
-    smoothedStepT[1] = (VO_STEP_SMOOTH_ALPHA * sy) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[1]);
-    smoothedStepT[2] = (VO_STEP_SMOOTH_ALPHA * sz) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[2]);
-    lastStepNorm = Math.hypot(smoothedStepT[0], smoothedStepT[1], smoothedStepT[2]);
+    function updateHUDWithPose(pose) {
+      const rotation = rotationFromPose(pose);
+      const translation = translationFromPose(pose);
 
-    const gT = globalT.data64F;
-    gT[0] += smoothedStepT[0];
-    gT[1] += smoothedStepT[1];
-    gT[2] += smoothedStepT[2];
-    voStats.updates += 1;
-    return true;
-  }
+      statusValueEl.textContent = "Tracking";
+      rotationValueEl.textContent = rotation
+        .map((row) => `[${row.map(formatNumber).join(", ")}]`)
+        .join(" ");
+      translationValueEl.textContent = `[${translation.map(formatNumber).join(", ")}]`;
+      poseMatrixValueEl.textContent = matrixToText(pose);
+    }
 
-  const prevMat = pointsToMatNx2F64(prevPts);
-  const currMat = pointsToMatNx2F64(currPts);
+    function updateHUDAwaitingTracking(pointsCount) {
+      statusValueEl.textContent = `Initializing / lost tracking (features: ${pointsCount})`;
+      rotationValueEl.textContent = "--";
+      translationValueEl.textContent = "--";
+      poseMatrixValueEl.textContent = "Pose matrix unavailable";
+    }
 
-  // Approximate intrinsics from frame dimensions.
-  const fx = 0.8 * canvas.width;
-  const fy = 0.8 * canvas.width;
-  const cx = canvas.width / 2;
-  const cy = canvas.height / 2;
-
-  const K = cv.matFromArray(3, 3, cv.CV_64F, [
-    fx, 0, cx,
-    0, fy, cy,
-    0, 0, 1
-  ]);
-
-  const inlierMask = new cv.Mat();
-
-  let updated = false;
-  try {
-    voStats.mode = "essential";
-    const essential = cv.findEssentialMat(prevMat, currMat, K, cv.RANSAC, 0.999, 1.5, inlierMask);
-    if (essential && !essential.empty()) {
-      voStats.essentialOk += 1;
-      const R = new cv.Mat();
-      const t = new cv.Mat();
-      const inliers = cv.recoverPose(essential, prevMat, currMat, K, R, t, inlierMask);
-      voStats.lastInliers = Number.isFinite(inliers) ? inliers : 0;
-      voStats.recoverOk += 1;
-      voStats.lastErr = "";
-
-      const txRaw = t.data64F && t.data64F.length > 0 ? t.data64F[0] : 0;
-      const tyRaw = t.data64F && t.data64F.length > 1 ? t.data64F[1] : 0;
-      const tzRaw = t.data64F && t.data64F.length > 2 ? t.data64F[2] : 0;
-      const tNorm = Math.hypot(txRaw, tyRaw, tzRaw);
-      voStats.lastTNorm = tNorm;
-
-      if (!R.empty() && !t.empty() && Number.isFinite(tNorm) && tNorm > 1e-9) {
-        // T(k) = T(k-1) + R(k-1) * t(k), scale remains unknown in monocular VO.
-        // Use explicit numeric math to avoid silent matrix-op binding issues.
-        const gR = globalR.data64F;
-        const sx = (gR[0] * txRaw) + (gR[1] * tyRaw) + (gR[2] * tzRaw);
-        const sy = (gR[3] * txRaw) + (gR[4] * tyRaw) + (gR[5] * tzRaw);
-        const sz = (gR[6] * txRaw) + (gR[7] * tyRaw) + (gR[8] * tzRaw);
-
-        // Low-pass each translation step to reduce frame-to-frame jitter.
-        smoothedStepT[0] = (VO_STEP_SMOOTH_ALPHA * sx) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[0]);
-        smoothedStepT[1] = (VO_STEP_SMOOTH_ALPHA * sy) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[1]);
-        smoothedStepT[2] = (VO_STEP_SMOOTH_ALPHA * sz) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[2]);
-        lastStepNorm = Math.hypot(smoothedStepT[0], smoothedStepT[1], smoothedStepT[2]);
-        const gT = globalT.data64F;
-        gT[0] += smoothedStepT[0];
-        gT[1] += smoothedStepT[1];
-        gT[2] += smoothedStepT[2];
-
-        const composedR = new cv.Mat();
-        const zero2 = new cv.Mat();
-        cv.gemm(R, globalR, 1, zero2, 0, composedR);
-        globalR.delete();
-        globalR = composedR;
-
-        zero2.delete();
-        updated = true;
-        voStats.updates += 1;
+    async function startSLAM() {
+      if (hasStarted) {
+        return;
       }
 
-      R.delete();
-      t.delete();
-    }
-    if (essential) {
-      essential.delete();
-    }
-  } catch (err) {
-    voStats.lastErr = err && err.message ? err.message : "vo-solve-failed";
-  }
+      hasStarted = true;
+      startButtonEl.disabled = true;
+      startButtonEl.textContent = "Starting...";
 
-  prevMat.delete();
-  currMat.delete();
-  K.delete();
-  inlierMask.delete();
-  return updated;
-}
+      const constraints = {
+        video: {
+          facingMode: "environment",
+          aspectRatio: 16 / 9,
+          width: { ideal: 1280 },
+        },
+        audio: false,
+      };
 
-/* ---------------- FRAME LOOP ---------------- */
-function processFrame() {
-  if (!streaming) return;
+      try {
+        const media = await Camera.Initialize(constraints.video);
+        const video = media.el;
+        videoEl.srcObject = video.srcObject;
+        await videoEl.play();
 
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-  src.data.set(imageData.data);
-
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-  if (!prevGray || trackedPoints.length < MIN_POINTS) {
-    trackedPoints = detectFeatures(gray, MAX_POINTS);
-    smoothedDrawPoints = trackedPoints.map((p) => ({ x: p.x, y: p.y }));
-  } else {
-    const prevPtsMat = pointsToMat(trackedPoints);
-    const nextPtsMat = new cv.Mat();
-    const status = new cv.Mat();
-    const err = new cv.Mat();
-
-    cv.calcOpticalFlowPyrLK(
-      prevGray,
-      gray,
-      prevPtsMat,
-      nextPtsMat,
-      status,
-      err,
-      lkWinSize,
-      2,
-      lkCriteria
-    );
-
-    const candidates = [];
-    const statusLen = Math.min(status.rows * status.cols, trackedPoints.length);
-    const nextData = nextPtsMat.data32F || [];
-
-    for (let i = 0; i < statusLen; i++) {
-      if (status.data[i] !== 1) {
-        continue;
-      }
-      const nx = nextData[i * 2];
-      const ny = nextData[(i * 2) + 1];
-      const lkErr = err.data32F ? err.data32F[i] : 0;
-
-      if (
-        !Number.isFinite(nx) ||
-        !Number.isFinite(ny) ||
-        nx < 0 ||
-        ny < 0 ||
-        nx >= canvas.width ||
-        ny >= canvas.height ||
-        (Number.isFinite(lkErr) && lkErr > LK_ERR_MAX)
-      ) {
-        continue;
-      }
-
-      candidates.push({
-        raw: { x: nx, y: ny },
-        prev: trackedPoints[i],
-        prevDraw: smoothedDrawPoints[i]
-      });
-    }
-
-    const robustCandidates = [];
-    if (candidates.length > 0) {
-      const candidateMat = pointsToMat(candidates.map((c) => c.raw));
-      const backPtsMat = new cv.Mat();
-      const backStatus = new cv.Mat();
-      const backErr = new cv.Mat();
-
-      cv.calcOpticalFlowPyrLK(
-        gray,
-        prevGray,
-        candidateMat,
-        backPtsMat,
-        backStatus,
-        backErr,
-        lkWinSize,
-        2,
-        lkCriteria
-      );
-
-      const backData = backPtsMat.data32F || [];
-      for (let i = 0; i < candidates.length; i++) {
-        if (backStatus.data[i] !== 1) {
-          continue;
-        }
-
-        const bx = backData[i * 2];
-        const by = backData[(i * 2) + 1];
-        const reverseLkErr = backErr.data32F ? backErr.data32F[i] : 0;
-        if (
-          !Number.isFinite(bx) ||
-          !Number.isFinite(by) ||
-          (Number.isFinite(reverseLkErr) && reverseLkErr > LK_ERR_MAX)
-        ) {
-          continue;
-        }
-
-        const backtrackErr = Math.hypot(
-          bx - candidates[i].prev.x,
-          by - candidates[i].prev.y
+        const cover = resize2cover(
+          video.videoWidth,
+          video.videoHeight,
+          app.clientWidth,
+          app.clientHeight
         );
-        if (backtrackErr > FB_ERR_MAX) {
-          continue;
-        }
+        videoEl.style.width = `${cover.width}px`;
+        videoEl.style.height = `${cover.height}px`;
+        videoEl.style.left = `${cover.x}px`;
+        videoEl.style.top = `${cover.y}px`;
 
-        robustCandidates.push(candidates[i]);
-      }
+        canvasEl.width = app.clientWidth;
+        canvasEl.height = app.clientHeight;
+        const ctx = canvasEl.getContext("2d", { alpha: false, desynchronized: true });
 
-      candidateMat.delete();
-      backPtsMat.delete();
-      backStatus.delete();
-      backErr.delete();
-    }
+        statusValueEl.textContent = "Loading SLAM engine...";
+        const alva = await AlvaAR.Initialize(canvasEl.width, canvasEl.height);
 
-    const nextPts = [];
-    const nextDraw = [];
-    const motionPrevPts = [];
-    const motionCurrPts = [];
-    if (robustCandidates.length > 0) {
-      const flowDists = [];
-      for (let i = 0; i < robustCandidates.length; i++) {
-        const c = robustCandidates[i];
-        flowDists.push(Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y));
-      }
-      const medFlow = median(flowDists);
-      const madLike = median(flowDists.map((d) => Math.abs(d - medFlow)));
-      const flowThreshold = Math.max(
-        FLOW_OUTLIER_BASE,
-        medFlow + (FLOW_OUTLIER_SCALE * (madLike + 0.15))
-      );
+        overlayEl.remove();
+        statusValueEl.textContent = "Running";
 
-      for (let i = 0; i < robustCandidates.length; i++) {
-        const c = robustCandidates[i];
-        const flow = Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y);
-        if (flow > flowThreshold) {
-          continue;
-        }
-        nextPts.push(c.raw);
-        nextDraw.push(smoothPoint(c.raw, c.prevDraw));
-        motionPrevPts.push({ x: c.prev.x, y: c.prev.y });
-        motionCurrPts.push({ x: c.raw.x, y: c.raw.y });
-      }
-    }
+        onFrame(() => {
+          if (document.hidden) {
+            return true;
+          }
 
-    prevTrackedPoints = motionPrevPts.map((p) => ({ x: p.x, y: p.y }));
-    trackedPoints = nextPts;
-    smoothedDrawPoints = nextDraw;
+          ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+          ctx.drawImage(
+            videoEl,
+            0,
+            0,
+            video.videoWidth,
+            video.videoHeight,
+            cover.x,
+            cover.y,
+            cover.width,
+            cover.height
+          );
 
-    prevPtsMat.delete();
-    nextPtsMat.delete();
-    status.delete();
-    err.delete();
+          const frame = ctx.getImageData(0, 0, canvasEl.width, canvasEl.height);
+          const pose = alva.findCameraPose(frame);
 
-    if (trackedPoints.length < MIN_POINTS) {
-      const refill = detectFeatures(
-        gray,
-        MAX_POINTS - trackedPoints.length,
-        trackedPoints,
-        REFILL_BLOCK_RADIUS
-      );
-      for (let i = 0; i < refill.length && trackedPoints.length < MAX_POINTS; i++) {
-        trackedPoints.push(refill[i]);
-        smoothedDrawPoints.push({ x: refill[i].x, y: refill[i].y });
+          if (pose) {
+            updateHUDWithPose(pose);
+          } else {
+            const points = alva.getFramePoints();
+            updateHUDAwaitingTracking(points.length);
+          }
+
+          return true;
+        }, 30);
+      } catch (error) {
+        hasStarted = false;
+        statusValueEl.textContent = "Failed to start";
+        startButtonEl.disabled = false;
+        startButtonEl.textContent = "Start Camera SLAM";
+        alert(`Could not start AR SLAM camera: ${error.message}`);
       }
     }
 
-    if (prevTrackedPoints.length > 20 && motionCurrPts.length > 20) {
-      estimateMotion(prevTrackedPoints, motionCurrPts);
-    }
-  }
-
-  for (let i = 0; i < smoothedDrawPoints.length; i++) {
-    const p = smoothedDrawPoints[i];
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
-    ctx.fillStyle = "lime";
-    ctx.fill();
-  }
-
-  if (prevGray) {
-    prevGray.delete();
-  }
-  prevGray = gray.clone();
-
-  if (globalT && globalT.data64F && globalT.data64F.length >= 3) {
-    const tx = globalT.data64F[0];
-    const ty = globalT.data64F[1];
-    const tz = globalT.data64F[2];
-    const errTag = voStats.lastErr ? ` err:${voStats.lastErr.slice(0, 24)}` : "";
-    statusText.textContent =
-      `mode:${voStats.mode} Pts:${trackedPoints.length} step:${lastStepNorm.toFixed(5)} tN:${voStats.lastTNorm.toFixed(5)} inl:${voStats.lastInliers} E:${voStats.essentialOk} R:${voStats.recoverOk} upd:${voStats.updates}/${voStats.attempts}${errTag} | T:${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
-  } else {
-    statusText.textContent = `Pts: ${trackedPoints.length} | VO initializing...`;
-  }
-
-  requestAnimationFrame(processFrame);
-}
-
-/* ---------------- INIT ---------------- */
-async function init() {
-  statusText.textContent = "Starting camera...";
-  await startCamera();
-  statusText.textContent = "Loading OpenCV...";
-  await waitForCV();
-
-  updateCanvasSize();
-
-  src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
-  gray = new cv.Mat();
-  lkWinSize = new cv.Size(21, 21);
-  lkCriteria = new cv.TermCriteria(
-    cv.TermCriteria_EPS + cv.TermCriteria_COUNT,
-    30,
-    0.01
-  );
-  globalR = cv.Mat.eye(3, 3, cv.CV_64F);
-  globalT = cv.matFromArray(3, 1, cv.CV_64F, [0, 0, 0]);
-  smoothedStepT = [0, 0, 0];
-  lastStepNorm = 0;
-  voStats = {
-    attempts: 0,
-    essentialOk: 0,
-    recoverOk: 0,
-    updates: 0,
-    lastInliers: 0,
-    lastTNorm: 0,
-    lastErr: "",
-    mode: "init"
-  };
-
-  streaming = true;
-  statusText.textContent = "Tracking points / VO initializing...";
-  requestAnimationFrame(processFrame);
-}
-
-window.addEventListener("resize", updateCanvasSize);
-window.addEventListener("orientationchange", () => {
-  setTimeout(updateCanvasSize, 120);
-});
-
-startButton.addEventListener("click", async () => {
-  startButton.disabled = true;
-  startButton.textContent = "Starting...";
-  try {
-    await init();
-    startOverlay.style.display = "none";
-  } catch (err) {
-    const message = err && err.message ? err.message : "Failed to start AR camera.";
-    statusText.textContent = message;
-    startButton.disabled = false;
-    startButton.textContent = "Retry Start";
-  }
-});
-</script>
-
+    startButtonEl.addEventListener("click", startSLAM);
+  </script>
 </body>
 </html>
