@@ -117,9 +117,11 @@ const FLOW_OUTLIER_BASE = 2.8;
 const FLOW_OUTLIER_SCALE = 2.4;
 const REFILL_BLOCK_RADIUS = 10;
 const MIN_POSE_POINTS = 8;
-const MIN_POSE_INLIERS = 20;
+const MIN_POSE_INLIERS = 25;
 const ESSENTIAL_RANSAC_THRESH = 1.0;
 const ARROW_SCALE = 180;
+const STALL_DELTA_EPS = 0.015;
+const STALL_FRAME_LIMIT = 10;
 
 let globalR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 let globalT = [0, 0, 0];
@@ -129,6 +131,13 @@ let essentialInlierCount = 0;
 let inlierDrawPoints = [];
 let inlierDrawMask = [];
 let trajectory = [[0, 0, 0]];
+let lastRelativeT = [0, 0, 0];
+let staticMotionFrames = 0;
+let motionActivity = "INIT";
+let lastENorm = 0;
+let lastRDet = 1;
+let lastDeltaMotion = 0;
+let reseedRequested = false;
 
 /* ---------------- CAMERA ---------------- */
 async function startCamera() {
@@ -279,6 +288,7 @@ function resetTrackingState() {
   inlierDrawPoints = [];
   inlierDrawMask = [];
   latestRelativeT = [0, 0, 0];
+  latestRelativeR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 }
 
 function ensureFrameBufferSize() {
@@ -343,6 +353,50 @@ function isFiniteVec(arr) {
   return true;
 }
 
+function matData(mat) {
+  return mat.data64F || mat.data32F || mat.data || mat.data8U || [];
+}
+
+function frobeniusNorm(data) {
+  let sumSq = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    if (!Number.isFinite(v)) return NaN;
+    sumSq += v * v;
+  }
+  return Math.sqrt(sumSq);
+}
+
+function det3(m) {
+  return (m[0] * ((m[4] * m[8]) - (m[5] * m[7])))
+    - (m[1] * ((m[3] * m[8]) - (m[5] * m[6])))
+    + (m[2] * ((m[3] * m[7]) - (m[4] * m[6])));
+}
+
+function requestFeatureReseed(reason) {
+  if (!reseedRequested) {
+    if (reason === "pose_stall") {
+      console.warn("POSE STALL DETECTED");
+    } else {
+      console.warn(`FEATURE RESEED (${reason})`);
+    }
+  }
+  reseedRequested = true;
+}
+
+function reseedFeatures(grayMat, reason = "reset") {
+  resetTrackingState();
+  trackedPoints = detectFeatures(grayMat, MAX_POINTS);
+  smoothedDrawPoints = trackedPoints.map((p) => ({ x: p.x, y: p.y }));
+  if (prevGray) {
+    prevGray.delete();
+    prevGray = null;
+  }
+  prevGray = grayMat.clone();
+  reseedRequested = false;
+  statusText.textContent = `Tracking points (${reason})...`;
+}
+
 function drawArrow(x0, y0, x1, y1, color) {
   const angle = Math.atan2(y1 - y0, x1 - x0);
   const head = 10;
@@ -370,33 +424,40 @@ function updateDebugOverlay() {
   voDebug.textContent =
 `Tracked Points: ${trackedPoints.length}
 Inliers: ${essentialInlierCount}
+E-norm: ${Number.isFinite(lastENorm) ? lastENorm.toFixed(4) : "nan"}
+det(R): ${Number.isFinite(lastRDet) ? lastRDet.toFixed(4) : "nan"}
 t: [${tx.toFixed(2)}, ${ty.toFixed(2)}, ${tz.toFixed(2)}]
 globalT: [${globalT[0].toFixed(2)}, ${globalT[1].toFixed(2)}, ${globalT[2].toFixed(2)}]
+Delta t: ${lastDeltaMotion.toFixed(4)}
+Motion: ${motionActivity}
 R:
 ${latestRelativeR[0].toFixed(2)} ${latestRelativeR[1].toFixed(2)} ${latestRelativeR[2].toFixed(2)}
 ${latestRelativeR[3].toFixed(2)} ${latestRelativeR[4].toFixed(2)} ${latestRelativeR[5].toFixed(2)}
 ${latestRelativeR[6].toFixed(2)} ${latestRelativeR[7].toFixed(2)} ${latestRelativeR[8].toFixed(2)}
-Motion: ${motion.toFixed(2)}`;
+|t|: ${motion.toFixed(2)}`;
 }
 
 function estimatePoseFromTracks(prevPoints, currPoints) {
   essentialInlierCount = 0;
   inlierDrawPoints = [];
   inlierDrawMask = [];
+  lastENorm = 0;
+  lastRDet = 1;
 
   if (prevPoints.length < MIN_POSE_POINTS || currPoints.length !== prevPoints.length) {
     latestRelativeT = [0, 0, 0];
+    motionActivity = "INSUFFICIENT_POINTS";
     return;
   }
 
+  // Enforce ordering: currPts -> prevPts in both calls.
   const prevPtsMat = pointsToMat(prevPoints);
   const currPtsMat = pointsToMat(currPoints);
   const inlierMask = new cv.Mat();
-  const refineMask = new cv.Mat();
+  const poseMask = new cv.Mat();
   let inlierPrevMat = null;
   let inlierCurrMat = null;
   let essential = null;
-  let essentialRefined = null;
   let R = null;
   let t = null;
 
@@ -415,85 +476,66 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
       inlierMask
     );
 
+    // Validation gate before recoverPose.
     if (!essential || essential.empty() || essential.rows < 3 || essential.cols < 3) {
       latestRelativeT = [0, 0, 0];
+      motionActivity = "SKIP_NO_E";
+      return;
+    }
+    const eData = matData(essential);
+    if (!eData.length || !Number.isFinite(eData[0])) {
+      latestRelativeT = [0, 0, 0];
+      motionActivity = "SKIP_BAD_E";
+      return;
+    }
+    lastENorm = frobeniusNorm(eData);
+
+    const firstMaskData = matData(inlierMask);
+    const firstMaskLen = Math.min(firstMaskData.length, currPoints.length);
+    const inlierPrevPts = [];
+    const inlierCurrPts = [];
+    const inlierIndices = [];
+    for (let i = 0; i < currPoints.length; i++) {
+      const rawMaskValue = i < firstMaskLen ? firstMaskData[i] : 0;
+      const normalizedMaskValue = (rawMaskValue === 1 || rawMaskValue === 255) ? 1 : 0;
+      if (normalizedMaskValue === 1) {
+        inlierPrevPts.push(prevPoints[i]);
+        inlierCurrPts.push(currPoints[i]);
+        inlierIndices.push(i);
+      }
+    }
+
+    if (inlierCurrPts.length < MIN_POSE_INLIERS) {
+      latestRelativeT = [0, 0, 0];
+      motionActivity = "SKIP_LOW_INLIERS";
       return;
     }
 
+    inlierPrevMat = pointsToMat(inlierPrevPts);
+    inlierCurrMat = pointsToMat(inlierCurrPts);
     R = new cv.Mat();
     t = new cv.Mat();
 
     cv.recoverPose(
       essential,
-      currPtsMat,
-      prevPtsMat,
-      R,
-      t,
-      focalLength,
-      principalPoint,
-      inlierMask
-    );
-
-    const firstMaskData = inlierMask.data || inlierMask.data8U || [];
-    const firstMaskLen = Math.min(firstMaskData.length, currPoints.length);
-    const firstInlierPrevPts = [];
-    const firstInlierCurrPts = [];
-    const firstInlierIndices = [];
-
-    for (let i = 0; i < currPoints.length; i++) {
-      const rawMaskValue = i < firstMaskLen ? firstMaskData[i] : 0;
-      const normalizedMaskValue = (rawMaskValue === 1 || rawMaskValue === 255) ? 1 : 0;
-      if (normalizedMaskValue === 1) {
-        firstInlierPrevPts.push(prevPoints[i]);
-        firstInlierCurrPts.push(currPoints[i]);
-        firstInlierIndices.push(i);
-      }
-    }
-
-    if (firstInlierCurrPts.length < MIN_POSE_INLIERS) {
-      latestRelativeT = [0, 0, 0];
-      return;
-    }
-
-    inlierPrevMat = pointsToMat(firstInlierPrevPts);
-    inlierCurrMat = pointsToMat(firstInlierCurrPts);
-
-    essentialRefined = cv.findEssentialMat(
-      inlierCurrMat,
-      inlierPrevMat,
-      focalLength,
-      principalPoint,
-      cv.RANSAC,
-      0.999,
-      ESSENTIAL_RANSAC_THRESH,
-      refineMask
-    );
-
-    if (!essentialRefined || essentialRefined.empty() || essentialRefined.rows < 3 || essentialRefined.cols < 3) {
-      latestRelativeT = [0, 0, 0];
-      return;
-    }
-
-    cv.recoverPose(
-      essentialRefined,
       inlierCurrMat,
       inlierPrevMat,
       R,
       t,
       focalLength,
       principalPoint,
-      refineMask
+      poseMask
     );
 
-    const refineMaskData = refineMask.data || refineMask.data8U || [];
-    const refineMaskLen = Math.min(refineMaskData.length, firstInlierCurrPts.length);
+    const poseMaskData = matData(poseMask);
+    const poseMaskLen = Math.min(poseMaskData.length, inlierCurrPts.length);
     const finalInlierFlags = new Array(currPoints.length).fill(false);
     essentialInlierCount = 0;
-    for (let j = 0; j < firstInlierCurrPts.length; j++) {
-      const rawMaskValue = j < refineMaskLen ? refineMaskData[j] : 0;
+    for (let j = 0; j < inlierCurrPts.length; j++) {
+      const rawMaskValue = j < poseMaskLen ? poseMaskData[j] : 0;
       const normalizedMaskValue = (rawMaskValue === 1 || rawMaskValue === 255) ? 1 : 0;
       if (normalizedMaskValue === 1) {
-        finalInlierFlags[firstInlierIndices[j]] = true;
+        finalInlierFlags[inlierIndices[j]] = true;
         essentialInlierCount++;
       }
     }
@@ -505,6 +547,7 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
 
     if (essentialInlierCount < MIN_POSE_INLIERS) {
       latestRelativeT = [0, 0, 0];
+      motionActivity = "SKIP_POSE_INLIERS";
       return;
     }
 
@@ -512,21 +555,43 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
     const relativeT = readMat3x1(t);
     if (!relativeR || !relativeT || !isFiniteVec(relativeR) || !isFiniteVec(relativeT)) {
       latestRelativeT = [0, 0, 0];
+      motionActivity = "SKIP_BAD_RT";
       return;
     }
+    lastRDet = det3(relativeR);
 
     latestRelativeR = relativeR;
     latestRelativeT = relativeT;
 
+    const deltaMotion = Math.hypot(
+      relativeT[0] - lastRelativeT[0],
+      relativeT[1] - lastRelativeT[1],
+      relativeT[2] - lastRelativeT[2]
+    );
+    lastDeltaMotion = deltaMotion;
+    if (deltaMotion < STALL_DELTA_EPS) {
+      staticMotionFrames++;
+      motionActivity = "LOW_MOTION";
+      if (staticMotionFrames >= STALL_FRAME_LIMIT) {
+        motionActivity = "POSE_STALL";
+        requestFeatureReseed("pose_stall");
+      }
+    } else {
+      staticMotionFrames = 0;
+      motionActivity = "ACTIVE";
+    }
+
     const worldStep = multiplyMatVec3(globalR, relativeT);
     if (!isFiniteVec(worldStep)) {
       latestRelativeT = [0, 0, 0];
+      motionActivity = "SKIP_BAD_STEP";
       return;
     }
     globalT[0] += worldStep[0];
     globalT[1] += worldStep[1];
     globalT[2] += worldStep[2];
     globalR = multiplyMat3(relativeR, globalR);
+    lastRelativeT = [relativeT[0], relativeT[1], relativeT[2]];
 
     if (trajectory.length === 0) {
       trajectory.push([globalT[0], globalT[1], globalT[2]]);
@@ -545,13 +610,13 @@ function estimatePoseFromTracks(prevPoints, currPoints) {
     essentialInlierCount = 0;
     inlierDrawPoints = [];
     inlierDrawMask = [];
+    motionActivity = "ERROR";
   } finally {
     prevPtsMat.delete();
     currPtsMat.delete();
     inlierMask.delete();
-    refineMask.delete();
+    poseMask.delete();
     if (essential) essential.delete();
-    if (essentialRefined) essentialRefined.delete();
     if (inlierPrevMat) inlierPrevMat.delete();
     if (inlierCurrMat) inlierCurrMat.delete();
     if (R) R.delete();
@@ -655,13 +720,8 @@ function processFrame() {
 
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-  if (!prevGray || trackedPoints.length < MIN_POINTS) {
-    trackedPoints = detectFeatures(gray, MAX_POINTS);
-    smoothedDrawPoints = trackedPoints.map((p) => ({ x: p.x, y: p.y }));
-    essentialInlierCount = 0;
-    inlierDrawPoints = [];
-    inlierDrawMask = [];
-    latestRelativeT = [0, 0, 0];
+  if (reseedRequested || !prevGray || trackedPoints.length < MIN_POINTS) {
+    reseedFeatures(gray, reseedRequested ? "reseed" : "bootstrap");
   } else {
     const prevPtsMat = pointsToMat(trackedPoints);
     const nextPtsMat = new cv.Mat();
@@ -796,26 +856,19 @@ function processFrame() {
 
     estimatePoseFromTracks(voPrevPoints, voCurrPoints);
 
-    trackedPoints = nextPts;
-    smoothedDrawPoints = nextDraw;
+    if (reseedRequested || nextPts.length < MIN_POINTS) {
+      requestFeatureReseed(nextPts.length < MIN_POINTS ? "tracking_degenerate" : "pose_stall");
+      reseedFeatures(gray, "tracking_reset");
+    } else {
+      trackedPoints = nextPts;
+      smoothedDrawPoints = nextDraw;
+    }
 
     prevPtsMat.delete();
     nextPtsMat.delete();
     status.delete();
     err.delete();
 
-    if (trackedPoints.length < MIN_POINTS) {
-      const refill = detectFeatures(
-        gray,
-        MAX_POINTS - trackedPoints.length,
-        trackedPoints,
-        REFILL_BLOCK_RADIUS
-      );
-      for (let i = 0; i < refill.length && trackedPoints.length < MAX_POINTS; i++) {
-        trackedPoints.push(refill[i]);
-        smoothedDrawPoints.push({ x: refill[i].x, y: refill[i].y });
-      }
-    }
   }
 
   for (let i = 0; i < smoothedDrawPoints.length; i++) {
