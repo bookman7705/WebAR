@@ -45,8 +45,10 @@ let lkCriteria = null;
 const DRAW_SMOOTH_ALPHA = 0.22;
 const PIXEL_DEADZONE = 0.8;
 const LK_ERR_MAX = 18;
+const FB_ERR_MAX = 1.8;
 const FLOW_OUTLIER_BASE = 2.8;
 const FLOW_OUTLIER_SCALE = 2.4;
+const REFILL_BLOCK_RADIUS = 10;
 
 /* ---------------- CAMERA ---------------- */
 async function startCamera() {
@@ -79,9 +81,30 @@ function waitForCV() {
   });
 }
 
-function detectFeatures(grayMat, maxCorners = MAX_POINTS) {
+function detectFeatures(grayMat, maxCorners = MAX_POINTS, blockedPoints = [], blockRadius = REFILL_BLOCK_RADIUS) {
   const corners = new cv.Mat();
-  const mask = new cv.Mat();
+  const mask = new cv.Mat(grayMat.rows, grayMat.cols, cv.CV_8UC1, new cv.Scalar(255));
+
+  for (let i = 0; i < blockedPoints.length; i++) {
+    const p = blockedPoints[i];
+    if (
+      !Number.isFinite(p.x) ||
+      !Number.isFinite(p.y) ||
+      p.x < 0 ||
+      p.y < 0 ||
+      p.x >= grayMat.cols ||
+      p.y >= grayMat.rows
+    ) {
+      continue;
+    }
+    cv.circle(
+      mask,
+      new cv.Point(Math.round(p.x), Math.round(p.y)),
+      blockRadius,
+      new cv.Scalar(0),
+      -1
+    );
+  }
 
   cv.goodFeaturesToTrack(
     grayMat,
@@ -203,12 +226,65 @@ function processFrame() {
       });
     }
 
+    const robustCandidates = [];
+    if (candidates.length > 0) {
+      const candidateMat = pointsToMat(candidates.map((c) => c.raw));
+      const backPtsMat = new cv.Mat();
+      const backStatus = new cv.Mat();
+      const backErr = new cv.Mat();
+
+      cv.calcOpticalFlowPyrLK(
+        gray,
+        prevGray,
+        candidateMat,
+        backPtsMat,
+        backStatus,
+        backErr,
+        lkWinSize,
+        3,
+        lkCriteria
+      );
+
+      const backData = backPtsMat.data32F || [];
+      for (let i = 0; i < candidates.length; i++) {
+        if (backStatus.data[i] !== 1) {
+          continue;
+        }
+
+        const bx = backData[i * 2];
+        const by = backData[(i * 2) + 1];
+        const reverseLkErr = backErr.data32F ? backErr.data32F[i] : 0;
+        if (
+          !Number.isFinite(bx) ||
+          !Number.isFinite(by) ||
+          (Number.isFinite(reverseLkErr) && reverseLkErr > LK_ERR_MAX)
+        ) {
+          continue;
+        }
+
+        const backtrackErr = Math.hypot(
+          bx - candidates[i].prev.x,
+          by - candidates[i].prev.y
+        );
+        if (backtrackErr > FB_ERR_MAX) {
+          continue;
+        }
+
+        robustCandidates.push(candidates[i]);
+      }
+
+      candidateMat.delete();
+      backPtsMat.delete();
+      backStatus.delete();
+      backErr.delete();
+    }
+
     const nextPts = [];
     const nextDraw = [];
-    if (candidates.length > 0) {
+    if (robustCandidates.length > 0) {
       const flowDists = [];
-      for (let i = 0; i < candidates.length; i++) {
-        const c = candidates[i];
+      for (let i = 0; i < robustCandidates.length; i++) {
+        const c = robustCandidates[i];
         flowDists.push(Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y));
       }
       const medFlow = median(flowDists);
@@ -218,8 +294,8 @@ function processFrame() {
         medFlow + (FLOW_OUTLIER_SCALE * (madLike + 0.15))
       );
 
-      for (let i = 0; i < candidates.length; i++) {
-        const c = candidates[i];
+      for (let i = 0; i < robustCandidates.length; i++) {
+        const c = robustCandidates[i];
         const flow = Math.hypot(c.raw.x - c.prev.x, c.raw.y - c.prev.y);
         if (flow > flowThreshold) {
           continue;
@@ -238,7 +314,12 @@ function processFrame() {
     err.delete();
 
     if (trackedPoints.length < MIN_POINTS) {
-      const refill = detectFeatures(gray, MAX_POINTS - trackedPoints.length);
+      const refill = detectFeatures(
+        gray,
+        MAX_POINTS - trackedPoints.length,
+        trackedPoints,
+        REFILL_BLOCK_RADIUS
+      );
       for (let i = 0; i < refill.length && trackedPoints.length < MAX_POINTS; i++) {
         trackedPoints.push(refill[i]);
         smoothedDrawPoints.push({ x: refill[i].x, y: refill[i].y });
