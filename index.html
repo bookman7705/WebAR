@@ -93,7 +93,8 @@ let voStats = {
   updates: 0,
   lastInliers: 0,
   lastTNorm: 0,
-  lastErr: ""
+  lastErr: "",
+  mode: "init"
 };
 
 const MAX_POINTS = 180;
@@ -265,6 +266,50 @@ function estimateMotion(prevPts, currPts) {
   }
   voStats.attempts += 1;
 
+  // Fallback path for OpenCV.js builds without calib3d VO APIs.
+  if (typeof cv.findEssentialMat !== "function" || typeof cv.recoverPose !== "function") {
+    voStats.mode = "flow";
+    voStats.lastErr = "";
+    voStats.lastInliers = currPts.length;
+    voStats.essentialOk = 0;
+    voStats.recoverOk = 0;
+
+    const dxs = [];
+    const dys = [];
+    const mags = [];
+    const n = Math.min(prevPts.length, currPts.length);
+    for (let i = 0; i < n; i++) {
+      const dx = currPts[i].x - prevPts[i].x;
+      const dy = currPts[i].y - prevPts[i].y;
+      dxs.push(dx);
+      dys.push(dy);
+      mags.push(Math.hypot(dx, dy));
+    }
+
+    const medDx = median(dxs);
+    const medDy = median(dys);
+    const medMag = median(mags);
+
+    // Pseudo-VO (2D translation proxy + small forward term).
+    const sx = medDx / Math.max(canvas.width, 1);
+    const sy = medDy / Math.max(canvas.height, 1);
+    const sz = -medMag / Math.max(canvas.width, 1);
+    const tNorm = Math.hypot(sx, sy, sz);
+    voStats.lastTNorm = tNorm;
+
+    smoothedStepT[0] = (VO_STEP_SMOOTH_ALPHA * sx) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[0]);
+    smoothedStepT[1] = (VO_STEP_SMOOTH_ALPHA * sy) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[1]);
+    smoothedStepT[2] = (VO_STEP_SMOOTH_ALPHA * sz) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[2]);
+    lastStepNorm = Math.hypot(smoothedStepT[0], smoothedStepT[1], smoothedStepT[2]);
+
+    const gT = globalT.data64F;
+    gT[0] += smoothedStepT[0];
+    gT[1] += smoothedStepT[1];
+    gT[2] += smoothedStepT[2];
+    voStats.updates += 1;
+    return true;
+  }
+
   const prevMat = pointsToMatNx2F64(prevPts);
   const currMat = pointsToMatNx2F64(currPts);
 
@@ -284,6 +329,7 @@ function estimateMotion(prevPts, currPts) {
 
   let updated = false;
   try {
+    voStats.mode = "essential";
     const essential = cv.findEssentialMat(prevMat, currMat, K, cv.RANSAC, 0.999, 1.5, inlierMask);
     if (essential && !essential.empty()) {
       voStats.essentialOk += 1;
@@ -292,6 +338,7 @@ function estimateMotion(prevPts, currPts) {
       const inliers = cv.recoverPose(essential, prevMat, currMat, K, R, t, inlierMask);
       voStats.lastInliers = Number.isFinite(inliers) ? inliers : 0;
       voStats.recoverOk += 1;
+      voStats.lastErr = "";
 
       const txRaw = t.data64F && t.data64F.length > 0 ? t.data64F[0] : 0;
       const tyRaw = t.data64F && t.data64F.length > 1 ? t.data64F[1] : 0;
@@ -538,7 +585,7 @@ function processFrame() {
     const tz = globalT.data64F[2];
     const errTag = voStats.lastErr ? ` err:${voStats.lastErr.slice(0, 24)}` : "";
     statusText.textContent =
-      `Pts:${trackedPoints.length} step:${lastStepNorm.toFixed(5)} tN:${voStats.lastTNorm.toFixed(5)} inl:${voStats.lastInliers} E:${voStats.essentialOk} R:${voStats.recoverOk} upd:${voStats.updates}/${voStats.attempts}${errTag} | T:${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
+      `mode:${voStats.mode} Pts:${trackedPoints.length} step:${lastStepNorm.toFixed(5)} tN:${voStats.lastTNorm.toFixed(5)} inl:${voStats.lastInliers} E:${voStats.essentialOk} R:${voStats.recoverOk} upd:${voStats.updates}/${voStats.attempts}${errTag} | T:${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
   } else {
     statusText.textContent = `Pts: ${trackedPoints.length} | VO initializing...`;
   }
@@ -574,7 +621,8 @@ async function init() {
     updates: 0,
     lastInliers: 0,
     lastTNorm: 0,
-    lastErr: ""
+    lastErr: "",
+    mode: "init"
   };
 
   streaming = true;
