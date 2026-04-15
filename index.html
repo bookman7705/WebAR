@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Web AR SLAM Starter</title>
 
   <style>
@@ -16,6 +17,39 @@
       top: 0;
       left: 0;
     }
+
+    #startOverlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.75);
+      z-index: 10;
+    }
+
+    #startButton {
+      padding: 12px 18px;
+      border: 1px solid #2f2f2f;
+      border-radius: 10px;
+      background: #111;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    #statusText {
+      position: fixed;
+      left: 10px;
+      bottom: 10px;
+      color: #e5e5e5;
+      font-family: sans-serif;
+      font-size: 12px;
+      z-index: 11;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 6px 8px;
+      border-radius: 6px;
+    }
   </style>
 
   <script src="https://docs.opencv.org/4.x/opencv.js"></script>
@@ -23,13 +57,21 @@
 
 <body>
 
-<video id="video" autoplay playsinline></video>
+<div id="startOverlay">
+  <button id="startButton" type="button">Start AR Camera</button>
+</div>
+<div id="statusText">Tap "Start AR Camera" to begin.</div>
+
+<video id="video" autoplay muted playsinline webkit-playsinline></video>
 <canvas id="canvas"></canvas>
 
 <script>
 let video = document.getElementById("video");
 let canvas = document.getElementById("canvas");
 let ctx = canvas.getContext("2d");
+let startOverlay = document.getElementById("startOverlay");
+let startButton = document.getElementById("startButton");
+let statusText = document.getElementById("statusText");
 
 let streaming = false;
 
@@ -52,16 +94,39 @@ const REFILL_BLOCK_RADIUS = 10;
 
 /* ---------------- CAMERA ---------------- */
 async function startCamera() {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment" },
-    audio: false
-  });
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Camera API is not available in this browser.");
+  }
+
+  const constraintsToTry = [
+    { video: { facingMode: { exact: "environment" } }, audio: false },
+    { video: { facingMode: "environment" }, audio: false },
+    { video: true, audio: false }
+  ];
+
+  let stream = null;
+  let lastError = null;
+  for (let i = 0; i < constraintsToTry.length; i++) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraintsToTry[i]);
+      break;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (!stream) {
+    throw lastError || new Error("Unable to access camera.");
+  }
 
   video.srcObject = stream;
+  video.setAttribute("playsinline", "true");
+  video.setAttribute("webkit-playsinline", "true");
+  video.muted = true;
 
   return new Promise(resolve => {
     video.onloadedmetadata = () => {
-      video.play();
+      video.play().catch(() => {});
       resolve();
     };
   });
@@ -160,6 +225,13 @@ function median(values) {
   return sorted.length % 2 === 0
     ? (sorted[mid - 1] + sorted[mid]) * 0.5
     : sorted[mid];
+}
+
+function updateCanvasSize() {
+  const w = video.videoWidth || window.innerWidth;
+  const h = video.videoHeight || window.innerHeight;
+  canvas.width = w;
+  canvas.height = h;
 }
 
 /* ---------------- FRAME LOOP ---------------- */
@@ -345,11 +417,12 @@ function processFrame() {
 
 /* ---------------- INIT ---------------- */
 async function init() {
+  statusText.textContent = "Starting camera...";
   await startCamera();
+  statusText.textContent = "Loading OpenCV...";
   await waitForCV();
 
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  updateCanvasSize();
 
   src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
   gray = new cv.Mat();
@@ -361,10 +434,28 @@ async function init() {
   );
 
   streaming = true;
+  statusText.textContent = "Tracking points...";
   requestAnimationFrame(processFrame);
 }
 
-init();
+window.addEventListener("resize", updateCanvasSize);
+window.addEventListener("orientationchange", () => {
+  setTimeout(updateCanvasSize, 120);
+});
+
+startButton.addEventListener("click", async () => {
+  startButton.disabled = true;
+  startButton.textContent = "Starting...";
+  try {
+    await init();
+    startOverlay.style.display = "none";
+  } catch (err) {
+    const message = err && err.message ? err.message : "Failed to start AR camera.";
+    statusText.textContent = message;
+    startButton.disabled = false;
+    startButton.textContent = "Retry Start";
+  }
+});
 </script>
 
 </body>
