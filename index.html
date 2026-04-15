@@ -2,677 +2,178 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta
-    name="viewport"
-    content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"
-  />
-  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-  <title>Web AR SLAM Pose Viewer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+  <title>8th Wall AR Cube (Clean)</title>
+
   <style>
-    * {
-      box-sizing: border-box;
+    html, body {
       margin: 0;
       padding: 0;
-    }
-
-    html,
-    body {
-      width: 100%;
-      height: 100%;
       overflow: hidden;
-      background: #000;
-      color: #e6e6e6;
-      font-family: Arial, Helvetica, sans-serif;
-    }
-
-    #app {
-      position: relative;
-      width: 100%;
+      background: black;
       height: 100%;
-      overflow: hidden;
-      touch-action: none;
-    }
-
-    #camera {
-      position: absolute;
-      top: 0;
-      left: 0;
       width: 100%;
-      height: 100%;
-      object-fit: cover;
-      z-index: 0;
-      background: #000;
+      font-family: Arial, sans-serif;
     }
 
-    #processCanvas {
+    #camerafeed {
       position: absolute;
       inset: 0;
       width: 100%;
       height: 100%;
-      z-index: 1;
-      pointer-events: none;
-      opacity: 0;
     }
 
-    #arLayer {
+    #ui {
       position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      z-index: 1;
-      pointer-events: none;
-    }
-
-    #hud {
-      position: absolute;
-      left: 12px;
-      top: 12px;
-      right: 12px;
-      max-width: 560px;
-      z-index: 2;
-      background: rgba(0, 0, 0, 0.62);
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      border-radius: 10px;
-      padding: 12px;
-      backdrop-filter: blur(3px);
-    }
-
-    .row {
-      display: flex;
-      gap: 8px;
-      align-items: baseline;
-      margin-bottom: 8px;
-      flex-wrap: wrap;
-    }
-
-    .label {
-      color: #9eb9ff;
-      font-size: 12px;
-      min-width: 92px;
-    }
-
-    .value {
-      font-size: 14px;
-      color: #f4f7ff;
-      word-break: break-word;
-    }
-
-    pre {
-      margin-top: 8px;
-      font-size: 12px;
-      line-height: 1.3;
-      color: #d6ffd9;
-      white-space: pre;
-      overflow-x: auto;
-    }
-
-    #overlay {
-      position: absolute;
-      inset: 0;
-      z-index: 3;
-      background: rgba(0, 0, 0, 0.82);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 14px;
-      padding: 24px;
-      text-align: center;
-    }
-
-    #overlay p {
-      max-width: 560px;
-      color: #c8c8c8;
-      line-height: 1.4;
-      font-size: 14px;
-    }
-
-    #startButton {
-      border: 1px solid #fff;
-      color: #fff;
-      background: transparent;
+      top: 10px;
+      left: 10px;
+      color: white;
+      background: rgba(0,0,0,0.5);
+      padding: 10px;
       border-radius: 8px;
-      padding: 12px 18px;
-      font-size: 14px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
+      font-size: 13px;
+      z-index: 10;
+    }
+
+    #startBtn {
+      margin-top: 10px;
+      padding: 10px 14px;
+      background: white;
+      color: black;
+      border: none;
+      border-radius: 6px;
       cursor: pointer;
     }
   </style>
 </head>
+
 <body>
-  <div id="app">
-    <video id="camera" autoplay muted playsinline webkit-playsinline></video>
-    <canvas id="processCanvas"></canvas>
+  <canvas id="camerafeed"></canvas>
 
-    <div id="hud">
-      <div class="row">
-        <span class="label">Status:</span>
-        <span class="value" id="statusValue">Waiting to start</span>
-      </div>
-      <div class="row">
-        <span class="label">Rotation:</span>
-        <span class="value" id="rotationValue">--</span>
-      </div>
-      <div class="row">
-        <span class="label">Translation:</span>
-        <span class="value" id="translationValue">--</span>
-      </div>
-      <div class="row">
-        <span class="label">Plane / Model:</span>
-        <span class="value" id="planeValue">--</span>
-      </div>
-      <pre id="poseMatrixValue">Pose matrix unavailable</pre>
-    </div>
+  <div id="ui">
+    <div>Status: <span id="status">Idle</span></div>
+    <div>Tracking: <span id="tracking">Off</span></div>
+    <div>Object: <span id="object">None</span></div>
 
-    <div id="overlay">
-      <button id="startButton" type="button">Start Camera Pose</button>
-      <p>
-        Open this page over HTTPS or localhost, grant camera permission, and the
-        estimated camera pose (rotation + translation) will be shown live. Tap
-        on the screen after tracking starts to place a model on a detected
-        horizontal plane.
-      </p>
-    </div>
+    <button id="startBtn">Start AR</button>
   </div>
 
+  <!-- ✔ Correct: local XR binary bundle (NOT CDN) -->
+  <script src="./external/xr/xr.js" data-preload-chunks="slam"></script>
+
   <script>
-    const app = document.getElementById("app");
-    const videoEl = document.getElementById("camera");
-    const canvasEl = document.getElementById("processCanvas");
-    const overlayEl = document.getElementById("overlay");
-    const startButtonEl = document.getElementById("startButton");
+    const canvas = document.getElementById("camerafeed");
+    const statusEl = document.getElementById("status");
+    const trackingEl = document.getElementById("tracking");
+    const objectEl = document.getElementById("object");
+    const startBtn = document.getElementById("startBtn");
 
-    const statusValueEl = document.getElementById("statusValue");
-    const rotationValueEl = document.getElementById("rotationValue");
-    const translationValueEl = document.getElementById("translationValue");
-    const planeValueEl = document.getElementById("planeValue");
-    const poseMatrixValueEl = document.getElementById("poseMatrixValue");
-    let hasStarted = false;
-    let modules = null;
-    let shouldPlaceModel = false;
-    const SLAM_FOV_DEGREES = 45;
-    const TRACKING_SMOOTHING = 0.1;
-    const PLANE_SMOOTHING = 0.35;
-    const PLANE_SAMPLES_REQUIRED = 12;
-    const MAX_PLANE_POSITION_SPREAD = 0.12;
-    const POSE_MAX_TRANSLATION_JUMP = 0.2;
-    const POSE_MAX_ANGLE_JUMP_RAD = Math.PI * 0.2;
+    let cube = null;
+    let scene = null;
+    let camera = null;
+    let started = false;
 
-    async function importFirstAvailable(paths, label) {
-      const failures = [];
-
-      for (const path of paths) {
-        try {
-          const mod = await import(path);
-          return { mod, path };
-        } catch (error) {
-          const reason = (error && error.message) ? error.message : String(error);
-          failures.push(`${path} -> ${reason}`);
-        }
-      }
-
-      throw new Error(`${label} import failed.\n${failures.join("\n")}`);
+    function setStatus(s) {
+      statusEl.textContent = s;
     }
 
-    async function ensureModulesLoaded() {
-      if (modules) {
-        return modules;
-      }
-
-      const alvaCandidates = [
-        "./AlvaAR/examples/public/assets/alva_ar.js",
-        "./AlvaAR/dist/alva_ar.js",
-        "https://alanross.github.io/AlvaAR/examples/public/assets/alva_ar.js",
-      ];
-
-      const utilsCandidates = [
-        "./AlvaAR/examples/public/assets/utils.js",
-        "https://alanross.github.io/AlvaAR/examples/public/assets/utils.js",
-      ];
-
-      const connectorCandidates = [
-        "./AlvaAR/examples/public/assets/alva_ar_three.js",
-        "./AlvaAR/dist/alva_ar_three.js",
-        "https://alanross.github.io/AlvaAR/examples/public/assets/alva_ar_three.js",
-      ];
-
-      const [{ mod: alvaModule }, { mod: utilsModule }, { mod: connectorModule }, threeModule, gltfModule] = await Promise.all([
-        importFirstAvailable(alvaCandidates, "AlvaAR module"),
-        importFirstAvailable(utilsCandidates, "Utils module"),
-        importFirstAvailable(connectorCandidates, "AlvaAR THREE connector module"),
-        import("https://threejsfundamentals.org/threejs/resources/threejs/r132/build/three.module.js"),
-        import("https://threejsfundamentals.org/threejs/resources/threejs/r132/examples/jsm/loaders/GLTFLoader.js"),
-      ]);
-
-      modules = {
-        AlvaAR: alvaModule.AlvaAR,
-        onFrame: utilsModule.onFrame,
-        resize2cover: utilsModule.resize2cover,
-        AlvaARConnectorTHREE: connectorModule.AlvaARConnectorTHREE,
-        THREE: threeModule,
-        GLTFLoader: gltfModule.GLTFLoader,
-      };
-
-      return modules;
+    function setTracking(s) {
+      trackingEl.textContent = s;
     }
 
-    const formatNumber = (value) => (Number.isFinite(value) ? value.toFixed(4) : "NaN");
-
-    function matrixToText(pose) {
-      return [
-        `${formatNumber(pose[0])}  ${formatNumber(pose[1])}  ${formatNumber(pose[2])}  ${formatNumber(pose[3])}`,
-        `${formatNumber(pose[4])}  ${formatNumber(pose[5])}  ${formatNumber(pose[6])}  ${formatNumber(pose[7])}`,
-        `${formatNumber(pose[8])}  ${formatNumber(pose[9])}  ${formatNumber(pose[10])}  ${formatNumber(pose[11])}`,
-        `${formatNumber(pose[12])}  ${formatNumber(pose[13])}  ${formatNumber(pose[14])}  ${formatNumber(pose[15])}`,
-      ].join("\n");
+    function setObject(s) {
+      objectEl.textContent = s;
     }
 
-    function rotationFromPose(pose) {
-      return [
-        [pose[0], pose[1], pose[2]],
-        [pose[4], pose[5], pose[6]],
-        [pose[8], pose[9], pose[10]],
-      ];
-    }
+    function createARModule() {
+      return {
+        name: "ar-module",
 
-    function translationFromPose(pose) {
-      return [pose[12], pose[13], pose[14]];
-    }
+        onStart: () => {
+          const xrScene = XR8.Threejs.xrScene();
+          scene = xrScene.scene;
+          camera = xrScene.camera;
 
-    function updateHUDWithPose(pose) {
-      const rotation = rotationFromPose(pose);
-      const translation = translationFromPose(pose);
+          // Lighting
+          const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
+          scene.add(light);
 
-      statusValueEl.textContent = "Tracking";
-      rotationValueEl.textContent = rotation
-        .map((row) => `[${row.map(formatNumber).join(", ")}]`)
-        .join(" ");
-      translationValueEl.textContent = `[${translation.map(formatNumber).join(", ")}]`;
-      poseMatrixValueEl.textContent = matrixToText(pose);
-    }
-
-    function updateHUDAwaitingTracking(pointsCount) {
-      statusValueEl.textContent = `Initializing / lost tracking (features: ${pointsCount})`;
-      rotationValueEl.textContent = "--";
-      translationValueEl.textContent = "--";
-      planeValueEl.textContent = "No stable plane yet";
-      poseMatrixValueEl.textContent = "Pose matrix unavailable";
-    }
-
-    function quaternionAngularDistance(a, b) {
-      const dot = Math.min(1, Math.max(-1, Math.abs(a.dot(b))));
-      return 2 * Math.acos(dot);
-    }
-
-    async function openCameraStream() {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("Camera API is not available in this browser.");
-      }
-
-      const candidates = [
-        { video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
-        { video: { facingMode: "environment" }, audio: false },
-        { video: true, audio: false },
-      ];
-
-      const failures = [];
-
-      for (const constraints of candidates) {
-        try {
-          return await navigator.mediaDevices.getUserMedia(constraints);
-        } catch (error) {
-          const name = error && error.name ? error.name : "UnknownError";
-          const message = error && error.message ? error.message : String(error);
-          failures.push(`${name}: ${message}`);
-        }
-      }
-
-      throw new Error(failures.join(" | "));
-    }
-
-    async function attachStreamToVideo(stream) {
-      videoEl.srcObject = stream;
-
-      await new Promise((resolve, reject) => {
-        const onLoaded = async () => {
-          try {
-            await videoEl.play();
-            resolve();
-          } catch (error) {
-            reject(error);
-          } finally {
-            videoEl.onloadedmetadata = null;
-            videoEl.onerror = null;
-          }
-        };
-
-        videoEl.onloadedmetadata = onLoaded;
-        videoEl.onerror = () => {
-          reject(new Error("Video element failed to load camera stream."));
-        };
-      });
-    }
-
-    async function loadGLBModel(THREE, GLTFLoaderClass) {
-      const modelUrl = new URLSearchParams(window.location.search).get("model") || "./model.glb";
-      const loader = new GLTFLoaderClass();
-
-      try {
-        const gltf = await new Promise((resolve, reject) => {
-          loader.load(modelUrl, resolve, undefined, reject);
-        });
-
-        const modelRoot = gltf.scene;
-        const modelBounds = new THREE.Box3().setFromObject(modelRoot);
-        const modelSize = new THREE.Vector3();
-        modelBounds.getSize(modelSize);
-
-        // Normalize GLB to a practical AR height so tiny/huge source files are corrected.
-        if (modelSize.y > 0.0001) {
-          const targetHeightMeters = 0.35;
-          const uniformScale = targetHeightMeters / modelSize.y;
-          modelRoot.scale.setScalar(uniformScale);
-        }
-
-        // Recompute and rebase so the model stands on the detected plane.
-        const rebasedBounds = new THREE.Box3().setFromObject(modelRoot);
-        const rebasedCenter = new THREE.Vector3();
-        rebasedBounds.getCenter(rebasedCenter);
-        modelRoot.position.x -= rebasedCenter.x;
-        modelRoot.position.z -= rebasedCenter.z;
-        modelRoot.position.y -= rebasedBounds.min.y;
-
-        modelRoot.traverse((node) => {
-          if (node.isMesh) {
-            node.castShadow = false;
-            node.receiveShadow = false;
-          }
-        });
-
-        planeValueEl.textContent = `Model loaded: ${modelUrl}`;
-        return modelRoot;
-      } catch (error) {
-        // Fallback mesh allows AR pipeline testing when no GLB is present.
-        const fallback = new THREE.Mesh(
-          new THREE.BoxGeometry(0.35, 0.35, 0.35),
-          new THREE.MeshNormalMaterial({ flatShading: true })
-        );
-        fallback.position.y = 0.175;
-        planeValueEl.textContent = `GLB missing, using fallback cube (${modelUrl})`;
-        return fallback;
-      }
-    }
-
-    async function startSLAM() {
-      if (hasStarted) {
-        return;
-      }
-
-      hasStarted = true;
-      startButtonEl.disabled = true;
-      startButtonEl.textContent = "Starting...";
-      statusValueEl.textContent = "Loading scripts...";
-
-      try {
-        const { AlvaAR, onFrame, resize2cover, AlvaARConnectorTHREE, THREE, GLTFLoader } = await ensureModulesLoaded();
-        statusValueEl.textContent = "Requesting camera access...";
-
-        const stream = await openCameraStream();
-        await attachStreamToVideo(stream);
-
-        const cover = resize2cover(
-          videoEl.videoWidth,
-          videoEl.videoHeight,
-          app.clientWidth,
-          app.clientHeight
-        );
-        videoEl.style.width = `${cover.width}px`;
-        videoEl.style.height = `${cover.height}px`;
-        videoEl.style.left = `${cover.x}px`;
-        videoEl.style.top = `${cover.y}px`;
-
-        canvasEl.width = app.clientWidth;
-        canvasEl.height = app.clientHeight;
-        const ctx = canvasEl.getContext("2d", { alpha: false, desynchronized: true });
-
-        statusValueEl.textContent = "Loading SLAM engine...";
-        const alva = await AlvaAR.Initialize(canvasEl.width, canvasEl.height, SLAM_FOV_DEGREES);
-        const applyPose = AlvaARConnectorTHREE.Initialize(THREE);
-
-        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-        renderer.setClearColor(0, 0);
-        renderer.setPixelRatio(window.devicePixelRatio);
-        renderer.setSize(app.clientWidth, app.clientHeight);
-        renderer.domElement.id = "arLayer";
-        app.appendChild(renderer.domElement);
-
-        const scene = new THREE.Scene();
-        const arCamera = new THREE.PerspectiveCamera(
-          SLAM_FOV_DEGREES,
-          app.clientWidth / app.clientHeight,
-          0.01,
-          1000
-        );
-        arCamera.rotation.reorder("YXZ");
-        arCamera.updateProjectionMatrix();
-        scene.add(arCamera);
-
-        scene.add(new THREE.AmbientLight(0xffffff, 0.8));
-        scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.8));
-
-        const reticle = new THREE.Mesh(
-          new THREE.CircleGeometry(0.12, 24),
-          new THREE.MeshBasicMaterial({
-            color: 0x44ff88,
-            transparent: true,
-            opacity: 0.45,
-            side: THREE.DoubleSide,
-          })
-        );
-        reticle.visible = false;
-        scene.add(reticle);
-
-        const modelTemplate = await loadGLBModel(THREE, GLTFLoader);
-        const modelAnchor = new THREE.Group();
-        modelAnchor.visible = false;
-        scene.add(modelAnchor);
-
-        const trackedCamPosition = new THREE.Vector3();
-        const trackedCamQuaternion = new THREE.Quaternion();
-        const planePosition = new THREE.Vector3();
-        const planeQuaternion = new THREE.Quaternion();
-        const rawPosePosition = new THREE.Vector3();
-        const rawPoseQuaternion = new THREE.Quaternion();
-        const placementSamples = [];
-        let hasCameraPose = false;
-        let hasPlanePose = false;
-        let rejectedPoseFrames = 0;
-
-        function averageSamples(samples) {
-          const avgPosition = new THREE.Vector3();
-          const avgQuaternion = new THREE.Quaternion(0, 0, 0, 0);
-          let reference = null;
-
-          for (const sample of samples) {
-            avgPosition.add(sample.position);
-
-            const q = sample.quaternion.clone();
-            if (reference === null) {
-              reference = q.clone();
-            } else if (reference.dot(q) < 0) {
-              q.multiplyScalar(-1);
-            }
-
-            avgQuaternion.x += q.x;
-            avgQuaternion.y += q.y;
-            avgQuaternion.z += q.z;
-            avgQuaternion.w += q.w;
-          }
-
-          avgPosition.multiplyScalar(1 / samples.length);
-          avgQuaternion.normalize();
-
-          return { position: avgPosition, quaternion: avgQuaternion };
-        }
-
-        function computePositionSpread(samples, center) {
-          let spread = 0;
-          for (const sample of samples) {
-            spread = Math.max(spread, sample.position.distanceTo(center));
-          }
-          return spread;
-        }
-
-        app.addEventListener("pointerdown", () => {
-          shouldPlaceModel = true;
-          placementSamples.length = 0;
-          planeValueEl.textContent = "Tap registered, waiting for plane...";
-        });
-
-        overlayEl.remove();
-        statusValueEl.textContent = "Running (tap to place model)";
-        planeValueEl.textContent = "Searching for horizontal plane...";
-
-        onFrame(() => {
-          if (document.hidden) {
-            return true;
-          }
-
-          ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-          ctx.drawImage(
-            videoEl,
-            0,
-            0,
-            videoEl.videoWidth,
-            videoEl.videoHeight,
-            cover.x,
-            cover.y,
-            cover.width,
-            cover.height
+          // Cube (hidden initially)
+          cube = new THREE.Mesh(
+            new THREE.BoxGeometry(0.25, 0.25, 0.25),
+            new THREE.MeshStandardMaterial({ color: 0x00aaff })
           );
 
-          const frame = ctx.getImageData(0, 0, canvasEl.width, canvasEl.height);
-          const pose = alva.findCameraPose(frame);
+          cube.visible = false;
+          scene.add(cube);
 
-          if (pose) {
-            updateHUDWithPose(pose);
-            applyPose(pose, rawPoseQuaternion, rawPosePosition);
+          setStatus("AR Ready");
+          setTracking("Scanning...");
+        },
 
-            if (!hasCameraPose) {
-              trackedCamPosition.copy(rawPosePosition);
-              trackedCamQuaternion.copy(rawPoseQuaternion);
-              hasCameraPose = true;
-            } else {
-              const translationJump = trackedCamPosition.distanceTo(rawPosePosition);
-              const rotationJump = quaternionAngularDistance(trackedCamQuaternion, rawPoseQuaternion);
+        onUpdate: ({ processCpuResult }) => {
+          const status = processCpuResult?.reality?.worldTracking?.status;
+          if (status) setTracking(status);
+        },
 
-              if (translationJump > POSE_MAX_TRANSLATION_JUMP || rotationJump > POSE_MAX_ANGLE_JUMP_RAD) {
-                rejectedPoseFrames += 1;
-
-                // Ignore sporadic large jumps that make anchored content snap.
-                if (rejectedPoseFrames <= 6) {
-                  planeValueEl.textContent = "Filtering tracking spike...";
-                } else {
-                  // If jumps persist for several frames, resync to avoid getting stuck.
-                  trackedCamPosition.copy(rawPosePosition);
-                  trackedCamQuaternion.copy(rawPoseQuaternion);
-                  rejectedPoseFrames = 0;
-                }
-              } else {
-                rejectedPoseFrames = 0;
-                trackedCamPosition.lerp(rawPosePosition, TRACKING_SMOOTHING);
-                trackedCamQuaternion.slerp(rawPoseQuaternion, TRACKING_SMOOTHING);
-              }
-            }
-
-            arCamera.position.copy(trackedCamPosition);
-            arCamera.quaternion.copy(trackedCamQuaternion);
-
-            const planePose = alva.findPlane();
-
-            if (planePose) {
-              applyPose(planePose, rawPoseQuaternion, rawPosePosition);
-
-              if (!hasPlanePose) {
-                planePosition.copy(rawPosePosition);
-                planeQuaternion.copy(rawPoseQuaternion);
-                hasPlanePose = true;
-              } else {
-                planePosition.lerp(rawPosePosition, PLANE_SMOOTHING);
-                planeQuaternion.slerp(rawPoseQuaternion, PLANE_SMOOTHING);
-              }
-
-              reticle.visible = true;
-              reticle.position.copy(planePosition);
-              reticle.quaternion.copy(planeQuaternion);
-
-              planeValueEl.textContent = shouldPlaceModel
-                ? "Plane detected - stabilizing anchor..."
-                : "Plane detected (tap to place model)";
-
-              if (shouldPlaceModel) {
-                placementSamples.push({
-                  position: planePosition.clone(),
-                  quaternion: planeQuaternion.clone(),
-                });
-
-                if (placementSamples.length > PLANE_SAMPLES_REQUIRED) {
-                  placementSamples.shift();
-                }
-
-                if (placementSamples.length === PLANE_SAMPLES_REQUIRED) {
-                  const averaged = averageSamples(placementSamples);
-                  const spread = computePositionSpread(placementSamples, averaged.position);
-
-                  if (spread <= MAX_PLANE_POSITION_SPREAD) {
-                    modelAnchor.clear();
-                    const instance = modelTemplate.clone(true);
-                    modelAnchor.add(instance);
-                    modelAnchor.position.copy(averaged.position);
-                    modelAnchor.quaternion.copy(averaged.quaternion);
-                    modelAnchor.visible = true;
-                    shouldPlaceModel = false;
-                    placementSamples.length = 0;
-                    planeValueEl.textContent = "Model anchored on stable horizontal plane";
-                  } else {
-                    planeValueEl.textContent = "Plane unstable, hold phone steady and keep scanning...";
-                  }
-                }
-              }
-            } else {
-              reticle.visible = false;
-              hasPlanePose = false;
-              if (shouldPlaceModel) {
-                planeValueEl.textContent = "No plane yet, keep moving camera slowly...";
-              } else {
-                planeValueEl.textContent = "Tracking, searching for horizontal plane...";
-              }
-            }
-          } else {
-            const points = alva.getFramePoints();
-            updateHUDAwaitingTracking(points.length);
-            reticle.visible = false;
-            hasPlanePose = false;
-          }
-
-          renderer.render(scene, arCamera);
-          return true;
-        }, 30);
-      } catch (error) {
-        hasStarted = false;
-        const message = (error && error.message) ? error.message : String(error);
-        statusValueEl.textContent = `Failed to start: ${message}`;
-        startButtonEl.disabled = false;
-        startButtonEl.textContent = "Start Camera Pose";
-        alert(
-          `Could not start AR SLAM camera.\n\n${message}\n\nIf this is mobile Safari/Chrome:\n- ensure camera permission is allowed for this site\n- close other apps using camera\n- reload page and tap Start again\n- use https:// and not in-app browser`
-        );
-      }
+        onRender: () => {
+          const { renderer, scene, camera } = XR8.Threejs.xrScene();
+          renderer.render(scene, camera);
+        }
+      };
     }
 
-    startButtonEl.textContent = "Start Camera Pose";
-    startButtonEl.addEventListener("click", startSLAM);
+    function placeCubeInFrontOfCamera() {
+      if (!cube || !camera) return;
+
+      // ✔ Stable SLAM-safe placement
+      const distance = 1.2;
+
+      const forward = new THREE.Vector3(0, 0, -1)
+        .applyQuaternion(camera.quaternion)
+        .normalize()
+        .multiplyScalar(distance);
+
+      cube.position.copy(camera.position).add(forward);
+      cube.quaternion.copy(camera.quaternion);
+
+      cube.visible = true;
+
+      setObject("Cube placed");
+    }
+
+    async function startAR() {
+      if (started) return;
+      started = true;
+
+      setStatus("Starting XR...");
+
+      await new Promise((resolve) => {
+        if (window.XR8) return resolve();
+        window.addEventListener("xrloaded", resolve, { once: true });
+      });
+
+      XR8.XrController.configure({
+        disableWorldTracking: false
+      });
+
+      XR8.addCameraPipelineModules([
+        XR8.GlTextureRenderer.pipelineModule(),
+        XR8.Threejs.pipelineModule(),
+        XR8.XrController.pipelineModule(),
+        createARModule()
+      ]);
+
+      await XR8.run({ canvas });
+
+      setStatus("Running");
+      setTracking("Active");
+
+      // ✔ Tap to place object
+      canvas.addEventListener("click", placeCubeInFrontOfCamera);
+    }
+
+    startBtn.addEventListener("click", startAR);
   </script>
 </body>
 </html>
