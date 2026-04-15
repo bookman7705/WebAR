@@ -50,6 +50,22 @@
       padding: 6px 8px;
       border-radius: 6px;
     }
+
+    #voDebug {
+      position: fixed;
+      left: 10px;
+      top: 10px;
+      color: #d7ffd7;
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.35;
+      z-index: 11;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 8px 10px;
+      border-radius: 6px;
+      white-space: pre;
+      pointer-events: none;
+    }
   </style>
 
   <script src="https://docs.opencv.org/4.x/opencv.js"></script>
@@ -61,6 +77,14 @@
   <button id="startButton" type="button">Start AR Camera</button>
 </div>
 <div id="statusText">Tap "Start AR Camera" to begin.</div>
+<div id="voDebug">Tracked Points: 0
+Inliers: 0
+t: [0.00, 0.00, 0.00]
+R:
+1.00 0.00 0.00
+0.00 1.00 0.00
+0.00 0.00 1.00
+Motion: 0.00</div>
 
 <video id="video" autoplay muted playsinline webkit-playsinline></video>
 <canvas id="canvas"></canvas>
@@ -72,6 +96,7 @@ let ctx = canvas.getContext("2d");
 let startOverlay = document.getElementById("startOverlay");
 let startButton = document.getElementById("startButton");
 let statusText = document.getElementById("statusText");
+let voDebug = document.getElementById("voDebug");
 
 let streaming = false;
 
@@ -91,6 +116,18 @@ const FB_ERR_MAX = 1.8;
 const FLOW_OUTLIER_BASE = 2.8;
 const FLOW_OUTLIER_SCALE = 2.4;
 const REFILL_BLOCK_RADIUS = 10;
+const MIN_POSE_POINTS = 8;
+const MIN_POSE_INLIERS = 20;
+const ESSENTIAL_RANSAC_THRESH = 1.0;
+const ARROW_SCALE = 180;
+
+let globalR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+let globalT = [0, 0, 0];
+let latestRelativeT = [0, 0, 0];
+let latestRelativeR = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+let essentialInlierCount = 0;
+let inlierDrawPoints = [];
+let inlierDrawMask = [];
 
 /* ---------------- CAMERA ---------------- */
 async function startCamera() {
@@ -234,10 +271,231 @@ function updateCanvasSize() {
   canvas.height = h;
 }
 
+function resetTrackingState() {
+  trackedPoints = [];
+  smoothedDrawPoints = [];
+  essentialInlierCount = 0;
+  inlierDrawPoints = [];
+  inlierDrawMask = [];
+  latestRelativeT = [0, 0, 0];
+}
+
+function ensureFrameBufferSize() {
+  if (!src || src.rows !== canvas.height || src.cols !== canvas.width) {
+    if (src) src.delete();
+    src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
+    if (prevGray) {
+      prevGray.delete();
+      prevGray = null;
+    }
+    resetTrackingState();
+  }
+}
+
+function multiplyMat3(a, b) {
+  return [
+    (a[0] * b[0]) + (a[1] * b[3]) + (a[2] * b[6]),
+    (a[0] * b[1]) + (a[1] * b[4]) + (a[2] * b[7]),
+    (a[0] * b[2]) + (a[1] * b[5]) + (a[2] * b[8]),
+    (a[3] * b[0]) + (a[4] * b[3]) + (a[5] * b[6]),
+    (a[3] * b[1]) + (a[4] * b[4]) + (a[5] * b[7]),
+    (a[3] * b[2]) + (a[4] * b[5]) + (a[5] * b[8]),
+    (a[6] * b[0]) + (a[7] * b[3]) + (a[8] * b[6]),
+    (a[6] * b[1]) + (a[7] * b[4]) + (a[8] * b[7]),
+    (a[6] * b[2]) + (a[7] * b[5]) + (a[8] * b[8])
+  ];
+}
+
+function multiplyMatVec3(m, v) {
+  return [
+    (m[0] * v[0]) + (m[1] * v[1]) + (m[2] * v[2]),
+    (m[3] * v[0]) + (m[4] * v[1]) + (m[5] * v[2]),
+    (m[6] * v[0]) + (m[7] * v[1]) + (m[8] * v[2])
+  ];
+}
+
+function readMat3x3(mat) {
+  const srcData = mat.data64F || mat.data32F;
+  if (!srcData || srcData.length < 9) {
+    return null;
+  }
+  const out = new Array(9);
+  for (let i = 0; i < 9; i++) {
+    out[i] = srcData[i];
+  }
+  return out;
+}
+
+function readMat3x1(mat) {
+  const srcData = mat.data64F || mat.data32F;
+  if (!srcData || srcData.length < 3) {
+    return null;
+  }
+  return [srcData[0], srcData[1], srcData[2]];
+}
+
+function drawArrow(x0, y0, x1, y1, color) {
+  const angle = Math.atan2(y1 - y0, x1 - x0);
+  const head = 10;
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - (head * Math.cos(angle - Math.PI / 6)), y1 - (head * Math.sin(angle - Math.PI / 6)));
+  ctx.lineTo(x1 - (head * Math.cos(angle + Math.PI / 6)), y1 - (head * Math.sin(angle + Math.PI / 6)));
+  ctx.closePath();
+  ctx.fill();
+}
+
+function updateDebugOverlay() {
+  const tx = latestRelativeT[0];
+  const ty = latestRelativeT[1];
+  const tz = latestRelativeT[2];
+  const motion = Math.hypot(tx, ty, tz);
+
+  voDebug.textContent =
+`Tracked Points: ${trackedPoints.length}
+Inliers: ${essentialInlierCount}
+t: [${tx.toFixed(2)}, ${ty.toFixed(2)}, ${tz.toFixed(2)}]
+R:
+${latestRelativeR[0].toFixed(2)} ${latestRelativeR[1].toFixed(2)} ${latestRelativeR[2].toFixed(2)}
+${latestRelativeR[3].toFixed(2)} ${latestRelativeR[4].toFixed(2)} ${latestRelativeR[5].toFixed(2)}
+${latestRelativeR[6].toFixed(2)} ${latestRelativeR[7].toFixed(2)} ${latestRelativeR[8].toFixed(2)}
+Motion: ${motion.toFixed(2)}`;
+}
+
+function estimatePoseFromTracks(prevPoints, currPoints) {
+  essentialInlierCount = 0;
+  inlierDrawPoints = [];
+  inlierDrawMask = [];
+
+  if (prevPoints.length < MIN_POSE_POINTS || currPoints.length !== prevPoints.length) {
+    latestRelativeT = [0, 0, 0];
+    return;
+  }
+
+  const prevPtsMat = pointsToMat(prevPoints);
+  const currPtsMat = pointsToMat(currPoints);
+  const inlierMask = new cv.Mat();
+  let essential = null;
+  let R = null;
+  let t = null;
+
+  try {
+    const focalLength = Math.max(canvas.width, 1);
+    const principalPoint = new cv.Point(canvas.width * 0.5, canvas.height * 0.5);
+
+    essential = cv.findEssentialMat(
+      currPtsMat,
+      prevPtsMat,
+      focalLength,
+      principalPoint,
+      cv.RANSAC,
+      0.999,
+      ESSENTIAL_RANSAC_THRESH,
+      inlierMask
+    );
+
+    if (!essential || essential.empty() || essential.rows < 3 || essential.cols < 3) {
+      latestRelativeT = [0, 0, 0];
+      return;
+    }
+
+    R = new cv.Mat();
+    t = new cv.Mat();
+
+    cv.recoverPose(
+      essential,
+      currPtsMat,
+      prevPtsMat,
+      R,
+      t,
+      focalLength,
+      principalPoint,
+      inlierMask
+    );
+
+    const maskData = inlierMask.data || inlierMask.data8U || [];
+    const maskLen = Math.min(maskData.length, currPoints.length);
+    for (let i = 0; i < currPoints.length; i++) {
+      const isInlier = i < maskLen ? maskData[i] > 0 : false;
+      inlierDrawPoints.push(currPoints[i]);
+      inlierDrawMask.push(isInlier);
+      if (isInlier) {
+        essentialInlierCount++;
+      }
+    }
+
+    if (essentialInlierCount < MIN_POSE_INLIERS) {
+      latestRelativeT = [0, 0, 0];
+      return;
+    }
+
+    const relativeR = readMat3x3(R);
+    const relativeT = readMat3x1(t);
+    if (!relativeR || !relativeT) {
+      latestRelativeT = [0, 0, 0];
+      return;
+    }
+
+    latestRelativeR = relativeR;
+    latestRelativeT = relativeT;
+
+    globalR = multiplyMat3(relativeR, globalR);
+    const worldStep = multiplyMatVec3(globalR, relativeT);
+    globalT[0] += worldStep[0];
+    globalT[1] += worldStep[1];
+    globalT[2] += worldStep[2];
+  } catch (err) {
+    latestRelativeT = [0, 0, 0];
+    essentialInlierCount = 0;
+    inlierDrawPoints = [];
+    inlierDrawMask = [];
+  } finally {
+    prevPtsMat.delete();
+    currPtsMat.delete();
+    inlierMask.delete();
+    if (essential) essential.delete();
+    if (R) R.delete();
+    if (t) t.delete();
+  }
+}
+
+function drawPoseDebugVisuals() {
+  if (inlierDrawPoints.length > 0) {
+    for (let i = 0; i < inlierDrawPoints.length; i++) {
+      const p = inlierDrawPoints[i];
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
+      ctx.fillStyle = inlierDrawMask[i] ? "#00ff66" : "#ff3b30";
+      ctx.fill();
+    }
+  }
+
+  const centerX = canvas.width * 0.5;
+  const centerY = canvas.height * 0.5;
+  const dirX = latestRelativeT[0];
+  const dirY = latestRelativeT[1];
+  const norm = Math.hypot(dirX, dirY);
+  if (norm > 1e-5) {
+    const maxLen = Math.min(canvas.width, canvas.height) * 0.22;
+    const arrowLen = Math.min(maxLen, ARROW_SCALE * norm);
+    const endX = centerX + ((dirX / norm) * arrowLen);
+    const endY = centerY + ((dirY / norm) * arrowLen);
+    drawArrow(centerX, centerY, endX, endY, "#36c4ff");
+  }
+}
+
 /* ---------------- FRAME LOOP ---------------- */
 function processFrame() {
   if (!streaming) return;
 
+  ensureFrameBufferSize();
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
   let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -249,6 +507,10 @@ function processFrame() {
   if (!prevGray || trackedPoints.length < MIN_POINTS) {
     trackedPoints = detectFeatures(gray, MAX_POINTS);
     smoothedDrawPoints = trackedPoints.map((p) => ({ x: p.x, y: p.y }));
+    essentialInlierCount = 0;
+    inlierDrawPoints = [];
+    inlierDrawMask = [];
+    latestRelativeT = [0, 0, 0];
   } else {
     const prevPtsMat = pointsToMat(trackedPoints);
     const nextPtsMat = new cv.Mat();
@@ -353,6 +615,8 @@ function processFrame() {
 
     const nextPts = [];
     const nextDraw = [];
+    const voPrevPoints = [];
+    const voCurrPoints = [];
     if (robustCandidates.length > 0) {
       const flowDists = [];
       for (let i = 0; i < robustCandidates.length; i++) {
@@ -374,8 +638,12 @@ function processFrame() {
         }
         nextPts.push(c.raw);
         nextDraw.push(smoothPoint(c.raw, c.prevDraw));
+        voPrevPoints.push(c.prev);
+        voCurrPoints.push(c.raw);
       }
     }
+
+    estimatePoseFromTracks(voPrevPoints, voCurrPoints);
 
     trackedPoints = nextPts;
     smoothedDrawPoints = nextDraw;
@@ -403,9 +671,12 @@ function processFrame() {
     const p = smoothedDrawPoints[i];
     ctx.beginPath();
     ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
-    ctx.fillStyle = "lime";
+    ctx.fillStyle = "rgba(170, 255, 170, 0.25)";
     ctx.fill();
   }
+
+  drawPoseDebugVisuals();
+  updateDebugOverlay();
 
   if (prevGray) {
     prevGray.delete();
