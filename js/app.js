@@ -1,6 +1,6 @@
 import { initCamera, getVideo } from './camera.js';
 import { initTracking, processTrackingFrame } from './tracking.js?v=tracking-fix-5';
-import { drawTracking, drawFeaturePointsOverlay } from './visualization.js?v=canvas2-overlay-1';
+import { drawTracking } from './visualization.js?v=tracking-loop-fix-1';
 import {
   initUI,
   updateHUD,
@@ -13,6 +13,17 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 
 let loopStarted = false;
+const trackingData = {
+  loading: true,
+  trackedCount: 0,
+  trackedPoints: [],
+  prevPoints: [],
+  status: 'Tracking LOST',
+  homography: null,
+  pose: null,
+  poseEssential: null,
+  poseDebug: null
+};
 
 function startRenderLoop() {
   if (loopStarted) {
@@ -29,32 +40,39 @@ function processFrame() {
     return;
   }
 
-  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+  // Safety: never process until camera metadata is available.
+  if (video.videoWidth === 0 || video.videoHeight === 0) {
+    requestAnimationFrame(processFrame);
+    return;
+  }
+
+  if (video.readyState >= video.HAVE_CURRENT_DATA) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
 
-    if (vw > 0 && vh > 0) {
+    if (canvas.width !== vw || canvas.height !== vh) {
       canvas.width = vw;
       canvas.height = vh;
-
-      ctx.drawImage(video, 0, 0);
-
-      const trackingData = processTrackingFrame(canvas, {
-        forceRedetect: consumeRedetectRequest()
-      });
-
-      drawTracking(
-        ctx,
-        trackingData,
-        isDebugDrawEnabled(),
-        isHomographyDebugEnabled()
-      );
-
-      // Draw on the same buffer as the video (1:1 with tracking coordinates).
-      drawFeaturePointsOverlay(ctx, trackingData, video, isDebugDrawEnabled());
-
-      updateHUD(trackingData.trackedCount, trackingData.status);
     }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Tracking updates continuously in the frame loop; button only forces a reset.
+    const frameTrackingData = processTrackingFrame(canvas, {
+      forceRedetect: consumeRedetectRequest()
+    });
+    Object.assign(trackingData, frameTrackingData);
+
+    drawTracking(
+      ctx,
+      trackingData,
+      video,
+      isDebugDrawEnabled(),
+      isHomographyDebugEnabled()
+    );
+
+    updateHUD(trackingData.trackedCount, trackingData.status);
   }
 
   requestAnimationFrame(processFrame);

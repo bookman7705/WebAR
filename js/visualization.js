@@ -263,7 +263,13 @@ function drawPoseInfoPanel(ctx, trackingData) {
   ctx.fillText(`Rot: ${rot.rx.toFixed(1)}, ${rot.ry.toFixed(1)}, ${rot.rz.toFixed(1)}`, panelX + 10, panelY + 164);
 }
 
-function drawTracking(ctx, trackingData, debugEnabled, homographyDebugEnabled = true) {
+function drawTracking(
+  ctx,
+  trackingData,
+  video,
+  debugEnabled,
+  homographyDebugEnabled = true
+) {
   if (!trackingData) {
     return;
   }
@@ -292,18 +298,27 @@ function drawTracking(ctx, trackingData, debugEnabled, homographyDebugEnabled = 
       ctx.fillText('ESSENTIAL POSE LOST', 12, 380);
     }
   }
+
+  // Keep feature rendering inside the main draw pipeline so it cannot be skipped.
+  drawFeaturePointsOverlay(ctx, trackingData, video, debugEnabled);
 }
 
 /**
  * Feature points in video/canvas pixel space; scales if buffer size differs.
  */
 function drawFeaturePointsOverlay(ctx, trackingData, video, debugEnabled) {
-  if (!trackingData || trackingData.loading || !video) {
+  if (
+    !trackingData ||
+    trackingData.loading ||
+    !video ||
+    video.videoWidth === 0 ||
+    video.videoHeight === 0
+  ) {
     return;
   }
 
-  const vw = video.videoWidth || 1;
-  const vh = video.videoHeight || 1;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
   const scaleX = ctx.canvas.width / vw;
   const scaleY = ctx.canvas.height / vh;
 
