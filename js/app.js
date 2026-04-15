@@ -1,6 +1,6 @@
 import { initCamera, getVideo } from './camera.js';
 import { initTracking, processTrackingFrame } from './tracking.js?v=tracking-fix-5';
-import { drawTracking } from './visualization.js?v=points-always-1';
+import { drawTracking, drawFeaturePointsOverlay } from './visualization.js?v=canvas2-overlay-1';
 import {
   initUI,
   updateHUD,
@@ -11,8 +11,24 @@ import {
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+const canvas2 = document.getElementById('canvas2');
+const ctx2 = canvas2 ? canvas2.getContext('2d') : null;
+
+/** Set true to draw a lime test square at (100,100) and periodic console logs */
+const DEBUG_CANVAS2_OVERLAY = false;
 
 let loopStarted = false;
+let canvas2DebugFrame = 0;
+
+function syncCanvas2ToVideo(video) {
+  if (!canvas2 || !video || video.videoWidth <= 0 || video.videoHeight <= 0) {
+    return;
+  }
+  if (canvas2.width !== video.videoWidth || canvas2.height !== video.videoHeight) {
+    canvas2.width = video.videoWidth;
+    canvas2.height = video.videoHeight;
+  }
+}
 
 function startRenderLoop() {
   if (loopStarted) {
@@ -33,6 +49,8 @@ function processFrame() {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
 
+    syncCanvas2ToVideo(video);
+
     ctx.drawImage(video, 0, 0);
 
     const trackingData = processTrackingFrame(canvas, {
@@ -45,6 +63,27 @@ function processFrame() {
       isDebugDrawEnabled(),
       isHomographyDebugEnabled()
     );
+
+    if (ctx2 && canvas2 && canvas2.width > 0 && canvas2.height > 0) {
+      ctx2.clearRect(0, 0, canvas2.width, canvas2.height);
+      if (DEBUG_CANVAS2_OVERLAY) {
+        ctx2.fillStyle = 'lime';
+        ctx2.fillRect(100, 100, 10, 10);
+        canvas2DebugFrame += 1;
+        if (canvas2DebugFrame % 30 === 1) {
+          const pts = trackingData.trackedPoints || [];
+          console.log('points:', pts);
+          console.log('canvas2 size:', canvas2.width, canvas2.height);
+        }
+      }
+      drawFeaturePointsOverlay(
+        ctx2,
+        trackingData,
+        video,
+        isDebugDrawEnabled()
+      );
+    }
+
     updateHUD(trackingData.trackedCount, trackingData.status);
   }
 
@@ -66,8 +105,13 @@ async function initApp() {
   video.addEventListener('play', startRenderLoop);
   video.addEventListener('playing', startRenderLoop);
   video.addEventListener('loadeddata', startRenderLoop);
+  video.addEventListener('loadedmetadata', () => {
+    syncCanvas2ToVideo(video);
+    startRenderLoop();
+  });
 
   if (video.readyState >= video.HAVE_CURRENT_DATA) {
+    syncCanvas2ToVideo(video);
     startRenderLoop();
   }
 }

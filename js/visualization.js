@@ -292,9 +292,22 @@ function drawTracking(ctx, trackingData, debugEnabled, homographyDebugEnabled = 
       ctx.fillText('ESSENTIAL POSE LOST', 12, 380);
     }
   }
+}
 
-  // FIX: Feature points must always draw — they were incorrectly gated behind
-  // "Debug Draw", so toggling OFF hid all green tracking markers.
+/**
+ * Video-space feature points drawn on overlay canvas2. Scales from video
+ * coordinates to the canvas buffer (which is synced to video dimensions).
+ */
+function drawFeaturePointsOverlay(ctx, trackingData, video, debugEnabled) {
+  if (!trackingData || trackingData.loading || !video) {
+    return;
+  }
+
+  const vw = video.videoWidth || 1;
+  const vh = video.videoHeight || 1;
+  const scaleX = ctx.canvas.width / vw;
+  const scaleY = ctx.canvas.height / vh;
+
   const trackedPoints = trackingData.trackedPoints || [];
   const prevPoints = trackingData.prevPoints || [];
   const nTracked = Math.floor(trackedPoints.length / 2);
@@ -308,10 +321,10 @@ function drawTracking(ctx, trackingData, debugEnabled, homographyDebugEnabled = 
   if (nPrev > 0 && nTracked > 0 && debugEnabled) {
     const n = Math.min(maxPoints, nPrev, nTracked);
     for (let i = 0; i < n; i++) {
-      const px = prevPoints[i * 2];
-      const py = prevPoints[i * 2 + 1];
-      const cx = trackedPoints[i * 2];
-      const cy = trackedPoints[i * 2 + 1];
+      const px = prevPoints[i * 2] * scaleX;
+      const py = prevPoints[i * 2 + 1] * scaleY;
+      const cx = trackedPoints[i * 2] * scaleX;
+      const cy = trackedPoints[i * 2 + 1] * scaleY;
       if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(cx) || !Number.isFinite(cy)) {
         continue;
       }
@@ -328,8 +341,8 @@ function drawTracking(ctx, trackingData, debugEnabled, homographyDebugEnabled = 
     }
   } else {
     for (let i = 0; i < Math.min(100, nTracked); i++) {
-      const cx = trackedPoints[i * 2];
-      const cy = trackedPoints[i * 2 + 1];
+      const cx = trackedPoints[i * 2] * scaleX;
+      const cy = trackedPoints[i * 2 + 1] * scaleY;
       if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
         continue;
       }
@@ -343,4 +356,4 @@ function drawTracking(ctx, trackingData, debugEnabled, homographyDebugEnabled = 
   }
 }
 
-export { drawTracking };
+export { drawTracking, drawFeaturePointsOverlay };

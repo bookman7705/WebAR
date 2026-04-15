@@ -5,9 +5,40 @@ body {
   font-family: sans-serif;
 }
 
-video, canvas {
+/* Stack: one visual frame — video (hidden), base canvas, overlay canvas2 */
+.camera-stack {
+  position: relative;
+  display: inline-block;
   width: 90%;
   max-width: 400px;
   margin-top: 10px;
+  line-height: 0;
   border: 2px solid white;
+  box-sizing: border-box;
+}
+
+/* Capture-only; frames are drawn to #canvas */
+#video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  vertical-align: top;
+}
+
+#canvas2 {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: auto;
+  z-index: 10;
+  pointer-events: none;
 }
