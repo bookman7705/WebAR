@@ -84,6 +84,7 @@ let prevTrackedPoints = [];
 // Monocular VO pose (scale-ambiguous translation)
 let globalR = null;
 let globalT = null;
+let smoothedStepT = [0, 0, 0];
 
 const MAX_POINTS = 180;
 const MIN_POINTS = 60;
@@ -96,6 +97,7 @@ const FB_ERR_MAX = 1.8;
 const FLOW_OUTLIER_BASE = 2.8;
 const FLOW_OUTLIER_SCALE = 2.4;
 const REFILL_BLOCK_RADIUS = 10;
+const VO_STEP_SMOOTH_ALPHA = 0.35;
 
 /* ---------------- CAMERA ---------------- */
 async function startCamera() {
@@ -244,17 +246,12 @@ function estimateMotion(prevPts, currPts) {
     return false;
   }
 
-  const n = Math.min(prevPts.length, currPts.length);
-  if (n < 8) return false;
-
-  const prevSubset = prevPts.slice(0, n);
-  const currSubset = currPts.slice(0, n);
-  const prevMat = pointsToMat(prevSubset);
-  const currMat = pointsToMat(currSubset);
+  const prevMat = pointsToMat(prevPts);
+  const currMat = pointsToMat(currPts);
 
   // Approximate intrinsics from frame dimensions.
-  const fx = canvas.width;
-  const fy = canvas.width;
+  const fx = 0.8 * canvas.width;
+  const fy = 0.8 * canvas.width;
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
 
@@ -269,18 +266,27 @@ function estimateMotion(prevPts, currPts) {
 
   let updated = false;
   try {
-    cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask, 1000);
+    cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask, E);
     if (!E.empty()) {
       const R = new cv.Mat();
       const t = new cv.Mat();
       cv.recoverPose(E, currMat, prevMat, K, R, t, inlierMask);
 
-      if (!R.empty() && !t.empty()) {
+      if (!R.empty() && !t.empty() && Math.abs(t.data64F[2]) >= 1e-6) {
         // T(k) = T(k-1) + R(k-1) * t(k), scale remains unknown in monocular VO.
         const translated = new cv.Mat();
         const zero1 = new cv.Mat();
         cv.gemm(globalR, t, 1, zero1, 0, translated);
-        cv.add(globalT, translated, globalT);
+
+        // Low-pass each translation step to reduce frame-to-frame jitter.
+        const sx = translated.data64F[0];
+        const sy = translated.data64F[1];
+        const sz = translated.data64F[2];
+        smoothedStepT[0] = (VO_STEP_SMOOTH_ALPHA * sx) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[0]);
+        smoothedStepT[1] = (VO_STEP_SMOOTH_ALPHA * sy) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[1]);
+        smoothedStepT[2] = (VO_STEP_SMOOTH_ALPHA * sz) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[2]);
+        const stepMat = cv.matFromArray(3, 1, cv.CV_64F, smoothedStepT);
+        cv.add(globalT, stepMat, globalT);
 
         const composedR = new cv.Mat();
         const zero2 = new cv.Mat();
@@ -290,6 +296,7 @@ function estimateMotion(prevPts, currPts) {
 
         zero1.delete();
         zero2.delete();
+        stepMat.delete();
         translated.delete();
         updated = true;
       }
@@ -428,6 +435,8 @@ function processFrame() {
 
     const nextPts = [];
     const nextDraw = [];
+    const motionPrevPts = [];
+    const motionCurrPts = [];
     if (robustCandidates.length > 0) {
       const flowDists = [];
       for (let i = 0; i < robustCandidates.length; i++) {
@@ -449,10 +458,12 @@ function processFrame() {
         }
         nextPts.push(c.raw);
         nextDraw.push(smoothPoint(c.raw, c.prevDraw));
+        motionPrevPts.push({ x: c.prev.x, y: c.prev.y });
+        motionCurrPts.push({ x: c.raw.x, y: c.raw.y });
       }
     }
 
-    prevTrackedPoints = trackedPoints;
+    prevTrackedPoints = motionPrevPts.map((p) => ({ x: p.x, y: p.y }));
     trackedPoints = nextPts;
     smoothedDrawPoints = nextDraw;
 
@@ -474,8 +485,8 @@ function processFrame() {
       }
     }
 
-    if (prevTrackedPoints.length > 20 && trackedPoints.length > 20) {
-      estimateMotion(prevTrackedPoints, trackedPoints);
+    if (prevTrackedPoints.length > 20 && motionCurrPts.length > 20) {
+      estimateMotion(prevTrackedPoints, motionCurrPts);
     }
   }
 
@@ -524,6 +535,7 @@ async function init() {
   );
   globalR = cv.Mat.eye(3, 3, cv.CV_64F);
   globalT = cv.matFromArray(3, 1, cv.CV_64F, [0, 0, 0]);
+  smoothedStepT = [0, 0, 0];
 
   streaming = true;
   statusText.textContent = "Tracking points / VO initializing...";
@@ -548,287 +560,6 @@ startButton.addEventListener("click", async () => {
     startButton.textContent = "Retry Start";
   }
 });
-</script>
-
-</body>
-</html><!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Fixed Web VO SLAM</title>
-
-<style>
-body {
-  margin: 0;
-  overflow: hidden;
-  background: black;
-}
-
-video, canvas {
-  position: absolute;
-  top: 0;
-  left: 0;
-}
-
-#hud {
-  position: fixed;
-  left: 10px;
-  top: 10px;
-  color: #d7ffd7;
-  font-family: monospace;
-  font-size: 12px;
-  background: rgba(0,0,0,0.5);
-  padding: 8px;
-  border-radius: 6px;
-  white-space: pre;
-}
-</style>
-
-<script src="https://docs.opencv.org/4.x/opencv.js"></script>
-</head>
-
-<body>
-
-<video id="video" autoplay playsinline muted></video>
-<canvas id="canvas"></canvas>
-<div id="hud">booting...</div>
-
-<script>
-
-let video = document.getElementById("video");
-let canvas = document.getElementById("canvas");
-let ctx = canvas.getContext("2d");
-let hud = document.getElementById("hud");
-
-let src, gray;
-let orb, bf;
-
-let prevKp = null;
-let prevDes = null;
-
-let globalR = [1,0,0,0,1,0,0,0,1];
-let globalT = [0,0,0];
-
-const MAX_FEATURES = 600;
-const MIN_INLIERS = 30;
-const FOCAL = 0.9 * 800;
-
-let frameId = 0;
-
-function matMul3(a,b){
-  return [
-    a[0]*b[0]+a[1]*b[3]+a[2]*b[6],
-    a[0]*b[1]+a[1]*b[4]+a[2]*b[7],
-    a[0]*b[2]+a[1]*b[5]+a[2]*b[8],
-
-    a[3]*b[0]+a[4]*b[3]+a[5]*b[6],
-    a[3]*b[1]+a[4]*b[4]+a[5]*b[7],
-    a[3]*b[2]+a[4]*b[5]+a[5]*b[8],
-
-    a[6]*b[0]+a[7]*b[3]+a[8]*b[6],
-    a[6]*b[1]+a[7]*b[4]+a[8]*b[7],
-    a[6]*b[2]+a[7]*b[5]+a[8]*b[8],
-  ];
-}
-
-function matVec3(m,v){
-  return [
-    m[0]*v[0]+m[1]*v[1]+m[2]*v[2],
-    m[3]*v[0]+m[4]*v[1]+m[5]*v[2],
-    m[6]*v[0]+m[7]*v[1]+m[8]*v[2],
-  ];
-}
-
-function waitCV(){
-  return new Promise(r=>{
-    const t=()=> (cv && cv.Mat) ? r() : setTimeout(t,50);
-    t();
-  });
-}
-
-async function startCamera(){
-  const s = await navigator.mediaDevices.getUserMedia({
-    video:{facingMode:"environment"}, audio:false
-  });
-
-  video.srcObject = s;
-  await new Promise(r=>video.onloadedmetadata=r);
-  video.play();
-}
-
-function resize(){
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
-  gray = new cv.Mat();
-}
-
-function toMat(points){
-  const arr=[];
-  for(let p of points) arr.push(p.x,p.y);
-  return cv.matFromArray(points.length,1,cv.CV_32FC2,arr);
-}
-
-function log(m){
-  hud.textContent = m;
-}
-
-function process(){
-  frameId++;
-
-  let kp = null;
-  let des = null;
-  let matches = null;
-  let mat1 = null;
-  let mat2 = null;
-  let mask = null;
-  let E = null;
-  let R = null;
-  let t = null;
-
-  try {
-    ctx.drawImage(video,0,0,canvas.width,canvas.height);
-    src.data.set(ctx.getImageData(0,0,canvas.width,canvas.height).data);
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-    kp = new cv.KeyPointVector();
-    des = new cv.Mat();
-    orb.detectAndCompute(gray,new cv.Mat(),kp,des);
-
-    let currPts=[];
-    for(let i=0;i<kp.size();i++){
-      let k=kp.get(i);
-      currPts.push({x:k.pt.x,y:k.pt.y});
-    }
-
-    if(!prevDes || prevDes.rows===0){
-      prevKp = currPts;
-      prevDes = des.clone();
-      return;
-    }
-
-    matches = new cv.DMatchVector();
-    bf.match(prevDes, des, matches);
-
-    let good=[];
-    for(let i=0;i<matches.size();i++){
-      let m=matches.get(i);
-      good.push(m);
-    }
-
-    good.sort((a,b)=>a.distance-b.distance);
-    good = good.slice(0,120);
-
-    let p1=[], p2=[];
-
-    for(let m of good){
-      if(m.queryIdx<prevKp.length && m.trainIdx<currPts.length){
-        p1.push(prevKp[m.queryIdx]);
-        p2.push(currPts[m.trainIdx]);
-      }
-    }
-
-    if(p1.length < 10){
-      prevKp = currPts;
-      prevDes = des.clone();
-      return;
-    }
-
-    mat1 = toMat(p1);
-    mat2 = toMat(p2);
-    mask = new cv.Mat();
-
-    E = cv.findEssentialMat(
-      mat2, mat1,
-      FOCAL,
-      new cv.Point(canvas.width/2, canvas.height/2),
-      cv.RANSAC,
-      0.999,
-      1.0,
-      mask
-    );
-
-    if(E.empty()){
-      log("E failed");
-      prevKp = currPts;
-      prevDes = des.clone();
-      return;
-    }
-
-    R = new cv.Mat();
-    t = new cv.Mat();
-
-    let inliers = cv.recoverPose(E, mat2, mat1, R, t, FOCAL, new cv.Point(canvas.width/2, canvas.height/2), mask);
-
-    if(inliers < MIN_INLIERS){
-      log("low inliers: " + inliers);
-      prevKp = currPts;
-      prevDes = des.clone();
-      return;
-    }
-
-    // ===== FIX 1: SCALE BOOST (debug visibility)
-    let tt = [t.data64F[0], t.data64F[1], t.data64F[2]];
-    const SCALE = 2.5;
-    tt = tt.map(v=>v*SCALE);
-
-    // ===== FIX 2: CORRECT SE(3) UPDATE
-    let newR = matMul3(globalR, [
-      R.data64F[0],R.data64F[1],R.data64F[2],
-      R.data64F[3],R.data64F[4],R.data64F[5],
-      R.data64F[6],R.data64F[7],R.data64F[8],
-    ]);
-
-    globalR = newR;
-
-    let worldT = matVec3(globalR, tt);
-
-    globalT[0]+=worldT[0];
-    globalT[1]+=worldT[1];
-    globalT[2]+=worldT[2];
-
-    log(
-`inliers: ${inliers}
-t: ${tt.map(v=>v.toFixed(2))}
-globalT: ${globalT.map(v=>v.toFixed(2))}
-frame: ${frameId}`
-    );
-
-    prevKp = currPts;
-    prevDes = des.clone();
-  } catch (err) {
-    log("process error: " + (err && err.message ? err.message : err));
-  } finally {
-    if (matches) matches.delete();
-    if (mat1) mat1.delete();
-    if (mat2) mat2.delete();
-    if (mask) mask.delete();
-    if (E) E.delete();
-    if (R) R.delete();
-    if (t) t.delete();
-    if (kp) kp.delete();
-    if (des) des.delete();
-
-    requestAnimationFrame(process);
-  }
-}
-
-async function init(){
-  await startCamera();
-  await waitCV();
-
-  resize();
-
-  orb = new cv.ORB(MAX_FEATURES);
-  bf = new cv.BFMatcher(cv.NORM_HAMMING,false);
-
-  log("running...");
-  requestAnimationFrame(process);
-}
-
-init();
-
 </script>
 
 </body>
