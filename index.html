@@ -85,6 +85,7 @@ let prevTrackedPoints = [];
 let globalR = null;
 let globalT = null;
 let smoothedStepT = [0, 0, 0];
+let lastStepNorm = 0;
 
 const MAX_POINTS = 180;
 const MIN_POINTS = 60;
@@ -265,14 +266,33 @@ function estimateMotion(prevPts, currPts) {
   const inlierMask = new cv.Mat();
 
   let updated = false;
+  let essential = null;
   try {
-    cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask, E);
-    if (!E.empty()) {
+    // OpenCV.js builds differ: some return Mat, others fill an output Mat.
+    try {
+      const maybeE = cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask);
+      if (maybeE && typeof maybeE.delete === "function" && typeof maybeE.empty === "function") {
+        essential = maybeE;
+      }
+    } catch (_) {
+      // Fallback below.
+    }
+    if (!essential) {
+      cv.findEssentialMat(currMat, prevMat, K, cv.RANSAC, 0.999, 1.0, inlierMask, E);
+      essential = E;
+    }
+
+    if (essential && !essential.empty()) {
       const R = new cv.Mat();
       const t = new cv.Mat();
-      cv.recoverPose(E, currMat, prevMat, K, R, t, inlierMask);
+      cv.recoverPose(essential, currMat, prevMat, K, R, t, inlierMask);
 
-      if (!R.empty() && !t.empty() && Math.abs(t.data64F[2]) >= 1e-6) {
+      const txRaw = t.data64F && t.data64F.length > 0 ? t.data64F[0] : 0;
+      const tyRaw = t.data64F && t.data64F.length > 1 ? t.data64F[1] : 0;
+      const tzRaw = t.data64F && t.data64F.length > 2 ? t.data64F[2] : 0;
+      const tNorm = Math.hypot(txRaw, tyRaw, tzRaw);
+
+      if (!R.empty() && !t.empty() && Number.isFinite(tNorm) && tNorm > 1e-9) {
         // T(k) = T(k-1) + R(k-1) * t(k), scale remains unknown in monocular VO.
         const translated = new cv.Mat();
         const zero1 = new cv.Mat();
@@ -285,6 +305,7 @@ function estimateMotion(prevPts, currPts) {
         smoothedStepT[0] = (VO_STEP_SMOOTH_ALPHA * sx) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[0]);
         smoothedStepT[1] = (VO_STEP_SMOOTH_ALPHA * sy) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[1]);
         smoothedStepT[2] = (VO_STEP_SMOOTH_ALPHA * sz) + ((1 - VO_STEP_SMOOTH_ALPHA) * smoothedStepT[2]);
+        lastStepNorm = Math.hypot(smoothedStepT[0], smoothedStepT[1], smoothedStepT[2]);
         const stepMat = cv.matFromArray(3, 1, cv.CV_64F, smoothedStepT);
         cv.add(globalT, stepMat, globalT);
 
@@ -312,6 +333,9 @@ function estimateMotion(prevPts, currPts) {
   currMat.delete();
   K.delete();
   E.delete();
+  if (essential && essential !== E) {
+    essential.delete();
+  }
   inlierMask.delete();
   return updated;
 }
@@ -508,7 +532,7 @@ function processFrame() {
     const ty = globalT.data64F[1];
     const tz = globalT.data64F[2];
     statusText.textContent =
-      `Pts: ${trackedPoints.length} | T: ${tx.toFixed(2)}, ${ty.toFixed(2)}, ${tz.toFixed(2)}`;
+      `Pts: ${trackedPoints.length} | step:${lastStepNorm.toFixed(5)} | T: ${tx.toFixed(5)}, ${ty.toFixed(5)}, ${tz.toFixed(5)}`;
   } else {
     statusText.textContent = `Pts: ${trackedPoints.length} | VO initializing...`;
   }
@@ -536,6 +560,7 @@ async function init() {
   globalR = cv.Mat.eye(3, 3, cv.CV_64F);
   globalT = cv.matFromArray(3, 1, cv.CV_64F, [0, 0, 0]);
   smoothedStepT = [0, 0, 0];
+  lastStepNorm = 0;
 
   streaming = true;
   statusText.textContent = "Tracking points / VO initializing...";
