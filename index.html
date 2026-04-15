@@ -161,10 +161,7 @@
     </div>
   </div>
 
-  <script type="module">
-    import { AlvaAR } from "./AlvaAR-main/examples/public/assets/alva_ar.js";
-    import { Camera, onFrame, resize2cover } from "./AlvaAR-main/examples/public/assets/utils.js";
-
+  <script>
     const app = document.getElementById("app");
     const videoEl = document.getElementById("camera");
     const canvasEl = document.getElementById("processCanvas");
@@ -176,6 +173,27 @@
     const translationValueEl = document.getElementById("translationValue");
     const poseMatrixValueEl = document.getElementById("poseMatrixValue");
     let hasStarted = false;
+    let modules = null;
+
+    async function ensureModulesLoaded() {
+      if (modules) {
+        return modules;
+      }
+
+      const [alvaModule, utilsModule] = await Promise.all([
+        import("./AlvaAR-main/examples/public/assets/alva_ar.js"),
+        import("./AlvaAR-main/examples/public/assets/utils.js"),
+      ]);
+
+      modules = {
+        AlvaAR: alvaModule.AlvaAR,
+        Camera: utilsModule.Camera,
+        onFrame: utilsModule.onFrame,
+        resize2cover: utilsModule.resize2cover,
+      };
+
+      return modules;
+    }
 
     const formatNumber = (value) => (Number.isFinite(value) ? value.toFixed(4) : "NaN");
 
@@ -227,6 +245,7 @@
       hasStarted = true;
       startButtonEl.disabled = true;
       startButtonEl.textContent = "Starting...";
+      statusValueEl.textContent = "Loading scripts...";
 
       const constraints = {
         video: {
@@ -238,6 +257,7 @@
       };
 
       try {
+        const { AlvaAR, Camera, onFrame, resize2cover } = await ensureModulesLoaded();
         const media = await Camera.Initialize(constraints.video);
         const video = media.el;
         videoEl.srcObject = video.srcObject;
@@ -296,13 +316,17 @@
         }, 30);
       } catch (error) {
         hasStarted = false;
-        statusValueEl.textContent = "Failed to start";
+        const message = (error && error.message) ? error.message : String(error);
+        statusValueEl.textContent = `Failed to start: ${message}`;
         startButtonEl.disabled = false;
         startButtonEl.textContent = "Start Camera SLAM";
-        alert(`Could not start AR SLAM camera: ${error.message}`);
+        alert(
+          `Could not start AR SLAM camera.\n\n${message}\n\nTip: serve this page from http://localhost or https:// (not file://).`
+        );
       }
     }
 
+    startButtonEl.textContent = "Start Camera Pose";
     startButtonEl.addEventListener("click", startSLAM);
   </script>
 </body>
