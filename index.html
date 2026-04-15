@@ -59,7 +59,7 @@
   </div>
 
   <!-- ✔ Correct: local XR binary bundle (NOT CDN) -->
-  <script src="./external/xr/xr.js" data-preload-chunks="slam"></script>
+  <script id="xr8Script" src="./external/xr/xr.js" data-preload-chunks="slam"></script>
 
   <script>
     const canvas = document.getElementById("camerafeed");
@@ -67,6 +67,7 @@
     const trackingEl = document.getElementById("tracking");
     const objectEl = document.getElementById("object");
     const startBtn = document.getElementById("startBtn");
+    const xr8ScriptEl = document.getElementById("xr8Script");
 
     let cube = null;
     let scene = null;
@@ -83,6 +84,47 @@
 
     function setObject(s) {
       objectEl.textContent = s;
+    }
+
+    async function waitForXR8(timeoutMs = 12000) {
+      if (window.XR8) {
+        return;
+      }
+
+      if (window.XR8Promise && typeof window.XR8Promise.then === "function") {
+        await window.XR8Promise;
+        return;
+      }
+
+      await new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          cleanup();
+          reject(new Error("Timed out waiting for XR8 runtime."));
+        }, timeoutMs);
+
+        const onLoaded = () => {
+          cleanup();
+          resolve();
+        };
+
+        const onScriptError = () => {
+          cleanup();
+          reject(new Error("Failed to load xr.js (check ./external/xr/xr.js path)."));
+        };
+
+        const cleanup = () => {
+          clearTimeout(timeoutId);
+          window.removeEventListener("xrloaded", onLoaded);
+          if (xr8ScriptEl) xr8ScriptEl.removeEventListener("error", onScriptError);
+        };
+
+        window.addEventListener("xrloaded", onLoaded, { once: true });
+        if (xr8ScriptEl) xr8ScriptEl.addEventListener("error", onScriptError, { once: true });
+      });
+
+      if (!window.XR8) {
+        throw new Error("XR8 runtime loaded event fired, but XR8 object is unavailable.");
+      }
     }
 
     function createARModule() {
@@ -145,32 +187,40 @@
     async function startAR() {
       if (started) return;
       started = true;
+      startBtn.disabled = true;
+      startBtn.textContent = "Starting...";
 
       setStatus("Starting XR...");
+      try {
+        await waitForXR8();
 
-      await new Promise((resolve) => {
-        if (window.XR8) return resolve();
-        window.addEventListener("xrloaded", resolve, { once: true });
-      });
+        XR8.XrController.configure({
+          disableWorldTracking: false
+        });
 
-      XR8.XrController.configure({
-        disableWorldTracking: false
-      });
+        XR8.addCameraPipelineModules([
+          XR8.GlTextureRenderer.pipelineModule(),
+          XR8.Threejs.pipelineModule(),
+          XR8.XrController.pipelineModule(),
+          createARModule()
+        ]);
 
-      XR8.addCameraPipelineModules([
-        XR8.GlTextureRenderer.pipelineModule(),
-        XR8.Threejs.pipelineModule(),
-        XR8.XrController.pipelineModule(),
-        createARModule()
-      ]);
+        await XR8.run({ canvas });
 
-      await XR8.run({ canvas });
+        setStatus("Running");
+        setTracking("Active");
+        startBtn.textContent = "AR Running";
 
-      setStatus("Running");
-      setTracking("Active");
-
-      // ✔ Tap to place object
-      canvas.addEventListener("click", placeCubeInFrontOfCamera);
+        // Tap to place object.
+        canvas.addEventListener("click", placeCubeInFrontOfCamera);
+      } catch (error) {
+        started = false;
+        startBtn.disabled = false;
+        startBtn.textContent = "Start AR";
+        setStatus(`Failed: ${error.message || String(error)}`);
+        setTracking("Off");
+        setObject("None");
+      }
     }
 
     startBtn.addEventListener("click", startAR);
