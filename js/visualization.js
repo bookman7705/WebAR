@@ -295,8 +295,7 @@ function drawTracking(ctx, trackingData, debugEnabled, homographyDebugEnabled = 
 }
 
 /**
- * Video-space feature points drawn on overlay canvas2. Scales from video
- * coordinates to the canvas buffer (which is synced to video dimensions).
+ * Feature points in video/canvas pixel space; scales if buffer size differs.
  */
 function drawFeaturePointsOverlay(ctx, trackingData, video, debugEnabled) {
   if (!trackingData || trackingData.loading || !video) {

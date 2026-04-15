@@ -29,8 +29,6 @@ const POSE_SMOOTH_ALPHA = 0.7;
 const MAX_POSE_TRANSLATION_DELTA = 2.5;
 const MAX_POSE_ROTATION_DELTA = 1.5;
 const MAX_REPROJECTION_ERROR = 5;
-// FIX: Reject abrupt quality drops instead of instantly replacing stable tracks.
-const MIN_TRACK_RETENTION_RATIO = 0.2;
 
 function loadOpenCv() {
   return new Promise((resolve, reject) => {
@@ -990,16 +988,9 @@ function processTrackingFrame(canvas, options = {}) {
     }
 
     let trackedCount = nextFramePoints.length;
-    // FIX: Drop low-quality abrupt updates and preserve last stable tracks.
-    if (
-      previousFramePoints.length > 30 &&
-      trackedCount < (previousFramePoints.length * MIN_TRACK_RETENTION_RATIO)
-    ) {
-      nextFramePoints = previousFramePoints.map((p) => ({ x: p.x, y: p.y }));
-      prevMatchedPoints = [];
-      currMatchedPoints = [];
-      trackedCount = nextFramePoints.length;
-    }
+    // Do not freeze/copy previous positions when LK returns few matches — that
+    // kept stale points on screen and reset lostFrames so automatic re-detect
+    // never ran. Let low counts increment lostFrames → full detectFeatures.
     if (trackedCount < RESET_TRACK_THRESHOLD) {
       lostFrames += 1;
     } else {
