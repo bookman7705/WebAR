@@ -3,8 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <title>Web AR SLAM Starter</title>
+
   <style>
-    body { margin: 0; overflow: hidden; background: black; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: black;
+    }
+
     video, canvas {
       position: absolute;
       top: 0;
@@ -12,11 +18,12 @@
     }
   </style>
 
-  <!-- OpenCV.js -->
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <!-- IMPORTANT: no async -->
+  <script src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 
 <body>
+
 <video id="video" autoplay playsinline></video>
 <canvas id="canvas"></canvas>
 
@@ -26,12 +33,21 @@ let canvas = document.getElementById("canvas");
 let ctx = canvas.getContext("2d");
 
 let streaming = false;
-let src, gray, orb, keypoints, descriptors;
 
-// 1. Start camera
+let src, gray;
+let orb;
+
+let keypoints = new cv.KeyPointVector();
+let descriptors = new cv.Mat();
+
+/* -----------------------------
+   CAMERA SETUP
+------------------------------*/
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment" },
+    video: {
+      facingMode: "environment"
+    },
     audio: false
   });
 
@@ -45,23 +61,40 @@ async function startCamera() {
   });
 }
 
-// 2. Wait for OpenCV
+/* -----------------------------
+   WAIT FOR OPENCV
+------------------------------*/
 function waitForCV() {
   return new Promise(resolve => {
-    cv['onRuntimeInitialized'] = () => resolve();
+    const check = () => {
+      if (typeof cv !== "undefined" && cv.Mat) {
+        resolve();
+      } else {
+        setTimeout(check, 50);
+      }
+    };
+    check();
   });
 }
 
-// 3. Processing loop
+/* -----------------------------
+   FRAME PROCESSING LOOP
+------------------------------*/
 function processFrame() {
   if (!streaming) return;
 
+  // draw video frame to canvas
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  src.data.set(ctx.getImageData(0, 0, canvas.width, canvas.height).data);
+  let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
+  // copy to OpenCV Mat
+  src.data.set(imageData.data);
+
+  // convert to grayscale
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
+  // detect features
   keypoints = new cv.KeyPointVector();
   descriptors = new cv.Mat();
 
@@ -70,6 +103,7 @@ function processFrame() {
   // draw keypoints
   for (let i = 0; i < keypoints.size(); i++) {
     let kp = keypoints.get(i);
+
     ctx.beginPath();
     ctx.arc(kp.pt.x, kp.pt.y, 2, 0, 2 * Math.PI);
     ctx.fillStyle = "lime";
@@ -82,10 +116,12 @@ function processFrame() {
   requestAnimationFrame(processFrame);
 }
 
-// 4. Init everything
+/* -----------------------------
+   INIT PIPELINE
+------------------------------*/
 async function init() {
-  await waitForCV();
   await startCamera();
+  await waitForCV();
 
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
