@@ -1,334 +1,38 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
-  <title>8th Wall AR Cube (Clean)</title>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>XR8 Test</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <style>
-    html, body {
-      margin: 0;
-      padding: 0;
-      overflow: hidden;
-      background: black;
-      height: 100%;
-      width: 100%;
-      font-family: Arial, sans-serif;
-    }
+    <!-- 8th Wall Engine -->
+    <script async src="./xr.js" data-preload-chunks="slam"></script>
 
-    #camerafeed {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-    }
+    <!-- 8th Wall A-Frame (8-Frame) -->
+    <script src="./aframe.min.js"></script>
+  </head>
 
-    #ui {
-      position: absolute;
-      top: 10px;
-      left: 10px;
-      color: white;
-      background: rgba(0,0,0,0.5);
-      padding: 10px;
-      border-radius: 8px;
-      font-size: 13px;
-      z-index: 10;
-    }
+  <body>
+    <!-- A-Frame Scene with XR8 enabled -->
+    <a-scene
+      xrconfig
+      xrweb
+      renderer="colorManagement: true"
+      embedded
+    >
+      <!-- Camera -->
+      <a-camera position="0 1.6 0"></a-camera>
 
-    #startBtn {
-      margin-top: 10px;
-      padding: 10px 14px;
-      background: white;
-      color: black;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-    }
-  </style>
-</head>
+      <!-- Simple object to verify rendering -->
+      <a-box
+        position="0 1 -3"
+        rotation="0 45 0"
+        color="#4CC3D9"
+      ></a-box>
 
-<body>
-  <canvas id="camerafeed"></canvas>
-
-  <div id="ui">
-    <div>Status: <span id="status">Idle</span></div>
-    <div>Tracking: <span id="tracking">Off</span></div>
-    <div>Object: <span id="object">None</span></div>
-
-    <button id="startBtn">Start AR</button>
-  </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.min.js"></script>
-  <script id="xr8Script" src="./external/xr/xr.js" data-preload-chunks="slam"></script>
-
-  <script>
-    const canvas = document.getElementById("camerafeed");
-    const statusEl = document.getElementById("status");
-    const trackingEl = document.getElementById("tracking");
-    const objectEl = document.getElementById("object");
-    const startBtn = document.getElementById("startBtn");
-    const xr8ScriptEl = document.getElementById("xr8Script");
-
-    let cube = null;
-    let scene = null;
-    let camera = null;
-    let started = false;
-
-    function setStatus(s) {
-      statusEl.textContent = s;
-    }
-
-    function setTracking(s) {
-      trackingEl.textContent = s;
-    }
-
-    function setObject(s) {
-      objectEl.textContent = s;
-    }
-
-    function loadScriptOnce(url, attrs = {}) {
-      return new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src = url;
-        script.async = true;
-        Object.entries(attrs).forEach(([key, value]) => script.setAttribute(key, value));
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error(`Failed loading script: ${url}`));
-        document.head.appendChild(script);
-      });
-    }
-
-    async function ensureXR8ScriptLoaded() {
-      if (window.XR8 || (window.XR8Promise && typeof window.XR8Promise.then === "function")) {
-        return;
-      }
-
-      const sources = [];
-      if (xr8ScriptEl && xr8ScriptEl.src) sources.push(xr8ScriptEl.src);
-      sources.push("https://cdn.jsdelivr.net/npm/@8thwall/engine-binary@1/dist/xr.js");
-
-      const seen = new Set();
-      const failures = [];
-
-      for (const src of sources) {
-        if (seen.has(src)) continue;
-        seen.add(src);
-        try {
-          // If this source is already attached in the DOM, wait for it instead of injecting duplicate tags.
-          if (xr8ScriptEl && xr8ScriptEl.src === src) {
-            await new Promise((resolve, reject) => {
-              if (window.XR8 || (window.XR8Promise && typeof window.XR8Promise.then === "function")) {
-                resolve();
-                return;
-              }
-
-              const onLoad = () => {
-                cleanup();
-                resolve();
-              };
-              const onError = () => {
-                cleanup();
-                reject(new Error(`Failed loading script: ${src}`));
-              };
-              const cleanup = () => {
-                xr8ScriptEl.removeEventListener("load", onLoad);
-                xr8ScriptEl.removeEventListener("error", onError);
-              };
-
-              xr8ScriptEl.addEventListener("load", onLoad, { once: true });
-              xr8ScriptEl.addEventListener("error", onError, { once: true });
-            });
-          } else {
-            await loadScriptOnce(src, { "data-preload-chunks": "slam", crossorigin: "anonymous" });
-          }
-
-          if (window.XR8 || (window.XR8Promise && typeof window.XR8Promise.then === "function")) {
-            return;
-          }
-          failures.push(`${src} loaded but XR8 global is still unavailable`);
-        } catch (error) {
-          failures.push(error.message || String(error));
-        }
-      }
-
-      throw new Error(`Could not initialize XR8 runtime. ${failures.join(" | ")}`);
-    }
-
-    async function waitForXR8(timeoutMs = 12000) {
-      await ensureXR8ScriptLoaded();
-
-      if (window.XR8) {
-        return;
-      }
-
-      if (window.XR8Promise && typeof window.XR8Promise.then === "function") {
-        try {
-          await Promise.race([
-            window.XR8Promise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for XR8Promise.")), timeoutMs))
-          ]);
-        } catch (error) {
-          throw error;
-        }
-
-        if (window.XR8) {
-          return;
-        }
-      }
-
-      // Some builds do not reliably fire xrloaded; poll XR8 global as fallback.
-      await new Promise((resolve, reject) => {
-        const start = Date.now();
-        const intervalId = setInterval(() => {
-          if (window.XR8) {
-            clearInterval(intervalId);
-            resolve();
-            return;
-          }
-
-          if (Date.now() - start >= timeoutMs) {
-            clearInterval(intervalId);
-            reject(new Error("Timed out waiting for XR8 runtime global."));
-          }
-        }, 100);
-      });
-
-      if (window.XR8) {
-        return;
-      }
-
-      await new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          cleanup();
-          reject(new Error("Timed out waiting for XR8 runtime."));
-        }, timeoutMs);
-
-        const onLoaded = () => {
-          cleanup();
-          resolve();
-        };
-
-        const onScriptError = () => {
-          cleanup();
-          reject(new Error("Failed to load xr.js (check ./external/xr/xr.js path)."));
-        };
-
-        const cleanup = () => {
-          clearTimeout(timeoutId);
-          window.removeEventListener("xrloaded", onLoaded);
-          if (xr8ScriptEl) xr8ScriptEl.removeEventListener("error", onScriptError);
-        };
-
-        window.addEventListener("xrloaded", onLoaded, { once: true });
-        if (xr8ScriptEl) xr8ScriptEl.addEventListener("error", onScriptError, { once: true });
-      });
-
-      if (!window.XR8) {
-        throw new Error("XR8 runtime loaded event fired, but XR8 object is unavailable.");
-      }
-    }
-
-    function createARModule() {
-      return {
-        name: "ar-module",
-
-        onStart: () => {
-          const xrScene = XR8.Threejs.xrScene();
-          scene = xrScene.scene;
-          camera = xrScene.camera;
-
-          // Lighting
-          const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
-          scene.add(light);
-
-          // Cube (hidden initially)
-          cube = new THREE.Mesh(
-            new THREE.BoxGeometry(0.25, 0.25, 0.25),
-            new THREE.MeshStandardMaterial({ color: 0x00aaff })
-          );
-
-          cube.visible = false;
-          scene.add(cube);
-
-          setStatus("AR Ready");
-          setTracking("Scanning...");
-        },
-
-        onUpdate: ({ processCpuResult }) => {
-          const status = processCpuResult?.reality?.worldTracking?.status;
-          if (status) setTracking(status);
-        },
-
-        onRender: () => {
-          const { renderer, scene, camera } = XR8.Threejs.xrScene();
-          renderer.render(scene, camera);
-        }
-      };
-    }
-
-    function placeCubeInFrontOfCamera() {
-      if (!cube || !camera) return;
-
-      // ✔ Stable SLAM-safe placement
-      const distance = 1.2;
-
-      const forward = new THREE.Vector3(0, 0, -1)
-        .applyQuaternion(camera.quaternion)
-        .normalize()
-        .multiplyScalar(distance);
-
-      cube.position.copy(camera.position).add(forward);
-      cube.quaternion.copy(camera.quaternion);
-
-      cube.visible = true;
-
-      setObject("Cube placed");
-    }
-
-    async function startAR() {
-      if (started) return;
-      started = true;
-      startBtn.disabled = true;
-      startBtn.textContent = "Starting...";
-
-      setStatus("Starting XR...");
-      try {
-        await waitForXR8();
-
-        XR8.XrController.configure({
-          disableWorldTracking: false
-        });
-
-        XR8.addCameraPipelineModules([
-          XR8.GlTextureRenderer.pipelineModule(),
-          XR8.Threejs.pipelineModule(),
-          XR8.XrController.pipelineModule(),
-          createARModule()
-        ]);
-
-        await XR8.run({ canvas });
-
-        setStatus("Running");
-        setTracking("Active");
-        startBtn.textContent = "AR Running";
-
-        // Tap to place object.
-        canvas.addEventListener("click", placeCubeInFrontOfCamera);
-      } catch (error) {
-        started = false;
-        startBtn.disabled = false;
-        startBtn.textContent = "Start AR";
-        const message = error.message || String(error);
-        const withHint = message.includes("Timed out")
-          ? `${message} (verify xr.js path or use network for CDN fallback)`
-          : message;
-        setStatus(`Failed: ${withHint}`);
-        setTracking("Off");
-        setObject("None");
-      }
-    }
-
-    startBtn.addEventListener("click", startAR);
-  </script>
-</body>
+      <!-- Light -->
+      <a-light type="directional" position="1 1 1"></a-light>
+      <a-light type="ambient" intensity="0.5"></a-light>
+    </a-scene>
+  </body>
 </html>
