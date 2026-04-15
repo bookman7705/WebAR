@@ -1,20 +1,106 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>CV Starter</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="style.css">
+  <meta charset="utf-8" />
+  <title>Web AR SLAM Starter</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: black; }
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+  </style>
+
+  <!-- OpenCV.js -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
+
 <body>
+<video id="video" autoplay playsinline></video>
+<canvas id="canvas"></canvas>
 
-<h2>Camera CV Test</h2>
+<script>
+let video = document.getElementById("video");
+let canvas = document.getElementById("canvas");
+let ctx = canvas.getContext("2d");
 
-<div class="camera-stack">
-  <video id="video" autoplay playsinline muted></video>
-  <canvas id="canvas"></canvas>
-</div>
+let streaming = false;
+let src, gray, orb, keypoints, descriptors;
 
-<script type="module" src="js/app.js?v=tracking-throttle-1"></script>
+// 1. Start camera
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment" },
+    audio: false
+  });
+
+  video.srcObject = stream;
+
+  return new Promise(resolve => {
+    video.onloadedmetadata = () => {
+      video.play();
+      resolve();
+    };
+  });
+}
+
+// 2. Wait for OpenCV
+function waitForCV() {
+  return new Promise(resolve => {
+    cv['onRuntimeInitialized'] = () => resolve();
+  });
+}
+
+// 3. Processing loop
+function processFrame() {
+  if (!streaming) return;
+
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  src.data.set(ctx.getImageData(0, 0, canvas.width, canvas.height).data);
+
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  keypoints = new cv.KeyPointVector();
+  descriptors = new cv.Mat();
+
+  orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
+
+  // draw keypoints
+  for (let i = 0; i < keypoints.size(); i++) {
+    let kp = keypoints.get(i);
+    ctx.beginPath();
+    ctx.arc(kp.pt.x, kp.pt.y, 2, 0, 2 * Math.PI);
+    ctx.fillStyle = "lime";
+    ctx.fill();
+  }
+
+  keypoints.delete();
+  descriptors.delete();
+
+  requestAnimationFrame(processFrame);
+}
+
+// 4. Init everything
+async function init() {
+  await waitForCV();
+  await startCamera();
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
+  gray = new cv.Mat();
+
+  orb = new cv.ORB();
+
+  streaming = true;
+  requestAnimationFrame(processFrame);
+}
+
+init();
+</script>
 
 </body>
 </html>
