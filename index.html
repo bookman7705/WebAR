@@ -54,6 +54,15 @@
       opacity: 0;
     }
 
+    #arLayer {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
+    }
+
     #hud {
       position: absolute;
       left: 12px;
@@ -149,14 +158,20 @@
         <span class="label">Translation:</span>
         <span class="value" id="translationValue">--</span>
       </div>
+      <div class="row">
+        <span class="label">Plane / Model:</span>
+        <span class="value" id="planeValue">--</span>
+      </div>
       <pre id="poseMatrixValue">Pose matrix unavailable</pre>
     </div>
 
     <div id="overlay">
-      <button id="startButton" type="button">Start Camera SLAM</button>
+      <button id="startButton" type="button">Start Camera Pose</button>
       <p>
         Open this page over HTTPS or localhost, grant camera permission, and the
-        estimated camera pose (rotation + translation) will be shown live.
+        estimated camera pose (rotation + translation) will be shown live. Tap
+        on the screen after tracking starts to place a model on a detected
+        horizontal plane.
       </p>
     </div>
   </div>
@@ -171,9 +186,11 @@
     const statusValueEl = document.getElementById("statusValue");
     const rotationValueEl = document.getElementById("rotationValue");
     const translationValueEl = document.getElementById("translationValue");
+    const planeValueEl = document.getElementById("planeValue");
     const poseMatrixValueEl = document.getElementById("poseMatrixValue");
     let hasStarted = false;
     let modules = null;
+    let shouldPlaceModel = false;
 
     async function importFirstAvailable(paths, label) {
       const failures = [];
@@ -207,15 +224,27 @@
         "https://alanross.github.io/AlvaAR/examples/public/assets/utils.js",
       ];
 
-      const [{ mod: alvaModule }, { mod: utilsModule }] = await Promise.all([
+      const connectorCandidates = [
+        "./AlvaAR/examples/public/assets/alva_ar_three.js",
+        "./AlvaAR/dist/alva_ar_three.js",
+        "https://alanross.github.io/AlvaAR/examples/public/assets/alva_ar_three.js",
+      ];
+
+      const [{ mod: alvaModule }, { mod: utilsModule }, { mod: connectorModule }, threeModule, gltfModule] = await Promise.all([
         importFirstAvailable(alvaCandidates, "AlvaAR module"),
         importFirstAvailable(utilsCandidates, "Utils module"),
+        importFirstAvailable(connectorCandidates, "AlvaAR THREE connector module"),
+        import("https://threejsfundamentals.org/threejs/resources/threejs/r132/build/three.module.js"),
+        import("https://threejsfundamentals.org/threejs/resources/threejs/r132/examples/jsm/loaders/GLTFLoader.js"),
       ]);
 
       modules = {
         AlvaAR: alvaModule.AlvaAR,
         onFrame: utilsModule.onFrame,
         resize2cover: utilsModule.resize2cover,
+        AlvaARConnectorTHREE: connectorModule.AlvaARConnectorTHREE,
+        THREE: threeModule,
+        GLTFLoader: gltfModule.GLTFLoader,
       };
 
       return modules;
@@ -260,6 +289,7 @@
       statusValueEl.textContent = `Initializing / lost tracking (features: ${pointsCount})`;
       rotationValueEl.textContent = "--";
       translationValueEl.textContent = "--";
+       planeValueEl.textContent = "No stable plane yet";
       poseMatrixValueEl.textContent = "Pose matrix unavailable";
     }
 
@@ -312,6 +342,38 @@
       });
     }
 
+    async function loadGLBModel(THREE, GLTFLoaderClass) {
+      const modelUrl = new URLSearchParams(window.location.search).get("model") || "./model.glb";
+      const loader = new GLTFLoaderClass();
+
+      try {
+        const gltf = await new Promise((resolve, reject) => {
+          loader.load(modelUrl, resolve, undefined, reject);
+        });
+
+        const modelRoot = gltf.scene;
+        modelRoot.scale.set(0.2, 0.2, 0.2);
+        modelRoot.traverse((node) => {
+          if (node.isMesh) {
+            node.castShadow = false;
+            node.receiveShadow = false;
+          }
+        });
+
+        planeValueEl.textContent = `Model loaded: ${modelUrl}`;
+        return modelRoot;
+      } catch (error) {
+        // Fallback mesh allows AR pipeline testing when no GLB is present.
+        const fallback = new THREE.Mesh(
+          new THREE.BoxGeometry(0.15, 0.15, 0.15),
+          new THREE.MeshNormalMaterial({ flatShading: true })
+        );
+        fallback.position.y = 0.075;
+        planeValueEl.textContent = `GLB missing, using fallback cube (${modelUrl})`;
+        return fallback;
+      }
+    }
+
     async function startSLAM() {
       if (hasStarted) {
         return;
@@ -323,7 +385,7 @@
       statusValueEl.textContent = "Loading scripts...";
 
       try {
-        const { AlvaAR, onFrame, resize2cover } = await ensureModulesLoaded();
+        const { AlvaAR, onFrame, resize2cover, AlvaARConnectorTHREE, THREE, GLTFLoader } = await ensureModulesLoaded();
         statusValueEl.textContent = "Requesting camera access...";
 
         const stream = await openCameraStream();
@@ -346,9 +408,49 @@
 
         statusValueEl.textContent = "Loading SLAM engine...";
         const alva = await AlvaAR.Initialize(canvasEl.width, canvasEl.height);
+        const applyPose = AlvaARConnectorTHREE.Initialize(THREE);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setClearColor(0, 0);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(app.clientWidth, app.clientHeight);
+        renderer.domElement.id = "arLayer";
+        app.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        const arCamera = new THREE.PerspectiveCamera(75, app.clientWidth / app.clientHeight, 0.01, 1000);
+        arCamera.rotation.reorder("YXZ");
+        arCamera.updateProjectionMatrix();
+        scene.add(arCamera);
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+        scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.8));
+
+        const reticle = new THREE.Mesh(
+          new THREE.CircleGeometry(0.12, 24),
+          new THREE.MeshBasicMaterial({
+            color: 0x44ff88,
+            transparent: true,
+            opacity: 0.45,
+            side: THREE.DoubleSide,
+          })
+        );
+        reticle.visible = false;
+        scene.add(reticle);
+
+        const modelTemplate = await loadGLBModel(THREE, GLTFLoader);
+        const modelAnchor = new THREE.Group();
+        modelAnchor.visible = false;
+        scene.add(modelAnchor);
+
+        app.addEventListener("pointerdown", () => {
+          shouldPlaceModel = true;
+          planeValueEl.textContent = "Tap registered, waiting for plane...";
+        });
 
         overlayEl.remove();
-        statusValueEl.textContent = "Running";
+        statusValueEl.textContent = "Running (tap to place model)";
+        planeValueEl.textContent = "Searching for horizontal plane...";
 
         onFrame(() => {
           if (document.hidden) {
@@ -373,11 +475,41 @@
 
           if (pose) {
             updateHUDWithPose(pose);
+            applyPose(pose, arCamera.quaternion, arCamera.position);
+
+            const planePose = alva.findPlane();
+
+            if (planePose) {
+              reticle.visible = true;
+              applyPose(planePose, reticle.quaternion, reticle.position);
+              planeValueEl.textContent = shouldPlaceModel
+                ? "Plane detected - placing model..."
+                : "Plane detected (tap to place model)";
+
+              if (shouldPlaceModel) {
+                modelAnchor.clear();
+                const instance = modelTemplate.clone(true);
+                modelAnchor.add(instance);
+                applyPose(planePose, modelAnchor.quaternion, modelAnchor.position);
+                modelAnchor.visible = true;
+                shouldPlaceModel = false;
+                planeValueEl.textContent = "Model placed on horizontal plane";
+              }
+            } else {
+              reticle.visible = false;
+              if (shouldPlaceModel) {
+                planeValueEl.textContent = "No plane yet, keep moving camera slowly...";
+              } else {
+                planeValueEl.textContent = "Tracking, searching for horizontal plane...";
+              }
+            }
           } else {
             const points = alva.getFramePoints();
             updateHUDAwaitingTracking(points.length);
+            reticle.visible = false;
           }
 
+          renderer.render(scene, arCamera);
           return true;
         }, 30);
       } catch (error) {
