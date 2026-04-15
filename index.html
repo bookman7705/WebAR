@@ -42,8 +42,8 @@ const MAX_POINTS = 180;
 const MIN_POINTS = 60;
 let lkWinSize = null;
 let lkCriteria = null;
-const DRAW_SMOOTH_ALPHA = 0.22;
-const PIXEL_DEADZONE = 0.8;
+const DRAW_SMOOTH_ALPHA = 0.5;
+const PIXEL_DEADZONE = 0.0;
 const LK_ERR_MAX = 18;
 const FB_ERR_MAX = 1.8;
 const FLOW_OUTLIER_BASE = 2.8;
@@ -191,7 +191,7 @@ function processFrame() {
       status,
       err,
       lkWinSize,
-      3,
+      2,
       lkCriteria
     );
 
@@ -241,7 +241,7 @@ function processFrame() {
         backStatus,
         backErr,
         lkWinSize,
-        3,
+        2,
         lkCriteria
       );
 
